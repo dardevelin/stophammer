@@ -1,7 +1,7 @@
 # ADR 0007: Cloudflare Workers as Tracker and Bootstrap Layer
 
 ## Status
-Proposed
+Superseded by ADR-0008
 
 ## Context
 Community nodes need a way to discover each other and bootstrap sync. In BitTorrent, this is done by a tracker or DHT. For stophammer, nodes need to:
