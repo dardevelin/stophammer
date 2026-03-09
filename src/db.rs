@@ -679,6 +679,165 @@ pub fn upsert_node_sync_state(
     Ok(())
 }
 
+// ── peer_nodes ────────────────────────────────────────────────────────────────
+
+/// A peer node registered for push fan-out.
+pub struct PeerNode {
+    /// Hex-encoded ed25519 public key identifying this peer.
+    pub node_pubkey:          String,
+    /// Base URL where this peer's `/sync/push` endpoint is reachable.
+    pub node_url:             String,
+    /// Unix timestamp (seconds) when this peer was first seen.
+    #[expect(dead_code, reason = "returned in GET /sync/peers for future use")]
+    pub discovered_at:        i64,
+    /// Unix timestamp (seconds) of the last successful push, if any.
+    pub last_push_at:         Option<i64>,
+    /// Number of consecutive delivery failures; peers at 5+ are skipped.
+    #[expect(dead_code, reason = "used indirectly via SQL WHERE clause in get_push_peers")]
+    pub consecutive_failures: i64,
+}
+
+/// Returns all peers with `consecutive_failures < 5`.
+///
+/// # Errors
+///
+/// Returns [`DbError::Rusqlite`] if the query or row mapping fails.
+pub fn get_push_peers(conn: &Connection) -> Result<Vec<PeerNode>, DbError> {
+    let mut stmt = conn.prepare(
+        "SELECT node_pubkey, node_url, discovered_at, last_push_at, consecutive_failures \
+         FROM peer_nodes WHERE consecutive_failures < 5",
+    )?;
+
+    let rows = stmt.query_map([], |row| {
+        Ok(PeerNode {
+            node_pubkey:          row.get(0)?,
+            node_url:             row.get(1)?,
+            discovered_at:        row.get(2)?,
+            last_push_at:         row.get(3)?,
+            consecutive_failures: row.get(4)?,
+        })
+    })?;
+
+    let mut peers = Vec::new();
+    for row in rows {
+        peers.push(row?);
+    }
+    Ok(peers)
+}
+
+/// Upserts a peer node record.
+///
+/// On conflict updates `node_url` only — preserves `discovered_at` and does
+/// **not** reset `consecutive_failures` (re-registration resets separately).
+///
+/// # Errors
+///
+/// Returns [`DbError::Rusqlite`] if the SQL upsert fails.
+pub fn upsert_peer_node(
+    conn:        &Connection,
+    node_pubkey: &str,
+    node_url:    &str,
+    now:         i64,
+) -> Result<(), DbError> {
+    conn.execute(
+        "INSERT INTO peer_nodes (node_pubkey, node_url, discovered_at) \
+         VALUES (?1, ?2, ?3) \
+         ON CONFLICT(node_pubkey) DO UPDATE SET node_url = excluded.node_url",
+        rusqlite::params![node_pubkey, node_url, now],
+    )?;
+    Ok(())
+}
+
+/// Records a successful push delivery: updates `last_push_at` and resets
+/// `consecutive_failures` to 0.
+///
+/// # Errors
+///
+/// Returns [`DbError::Rusqlite`] if the SQL update fails.
+pub fn record_push_success(conn: &Connection, node_pubkey: &str, now: i64) -> Result<(), DbError> {
+    conn.execute(
+        "UPDATE peer_nodes SET last_push_at = ?1, consecutive_failures = 0 \
+         WHERE node_pubkey = ?2",
+        rusqlite::params![now, node_pubkey],
+    )?;
+    Ok(())
+}
+
+/// Increments `consecutive_failures` by 1 for the given peer.
+///
+/// # Errors
+///
+/// Returns [`DbError::Rusqlite`] if the SQL update fails.
+pub fn increment_peer_failures(conn: &Connection, node_pubkey: &str) -> Result<(), DbError> {
+    conn.execute(
+        "UPDATE peer_nodes SET consecutive_failures = consecutive_failures + 1 \
+         WHERE node_pubkey = ?1",
+        rusqlite::params![node_pubkey],
+    )?;
+    Ok(())
+}
+
+/// Resets `consecutive_failures` to 0 for the given peer (called on re-registration).
+///
+/// # Errors
+///
+/// Returns [`DbError::Rusqlite`] if the SQL update fails.
+pub fn reset_peer_failures(conn: &Connection, node_pubkey: &str) -> Result<(), DbError> {
+    conn.execute(
+        "UPDATE peer_nodes SET consecutive_failures = 0 WHERE node_pubkey = ?1",
+        rusqlite::params![node_pubkey],
+    )?;
+    Ok(())
+}
+
+/// Inserts a single event row using `INSERT OR IGNORE`.
+///
+/// Returns `Some(seq)` if the event was newly inserted, or `None` if a row
+/// with the same `event_id` already existed (idempotent community-side apply).
+///
+/// # Errors
+///
+/// Returns [`DbError::Json`] if `event_type` or `warnings` cannot be
+/// serialised, or [`DbError::Rusqlite`] if the SQL fails.
+#[expect(clippy::too_many_arguments, reason = "all fields are required for a complete event row")]
+pub fn insert_event_idempotent(
+    conn:         &Connection,
+    event_id:     &str,
+    event_type:   &crate::event::EventType,
+    payload_json: &str,
+    subject_guid: &str,
+    signed_by:    &str,
+    signature:    &str,
+    created_at:   i64,
+    warnings:     &[String],
+) -> Result<Option<i64>, DbError> {
+    let et_str = event_type_str(event_type)?;
+    let warnings_json = serde_json::to_string(warnings)?;
+
+    // Use INSERT OR IGNORE so a duplicate event_id is a no-op.
+    let sql = "INSERT OR IGNORE INTO events \
+        (event_id, event_type, payload_json, subject_guid, signed_by, signature, seq, created_at, warnings_json) \
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, (SELECT COALESCE(MAX(seq),0)+1 FROM events), ?7, ?8)";
+
+    let changed = conn.execute(
+        sql,
+        rusqlite::params![event_id, et_str, payload_json, subject_guid, signed_by, signature, created_at, warnings_json],
+    )?;
+
+    if changed == 0 {
+        return Ok(None);
+    }
+
+    // Retrieve the seq that was just assigned.
+    let seq: i64 = conn.query_row(
+        "SELECT seq FROM events WHERE event_id = ?1",
+        rusqlite::params![event_id],
+        |row| row.get(0),
+    )?;
+
+    Ok(Some(seq))
+}
+
 // ── get_node_sync_cursor ──────────────────────────────────────────────────────
 
 /// Returns the `last_seq` cursor stored for `node_pubkey`, or `0` if none exists.

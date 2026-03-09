@@ -12,8 +12,9 @@
 //! to avoid stalling the async executor. Join errors are converted to
 //! [`ApiError`] with HTTP 500 rather than panicking.
 
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use axum::{
     extract::{Query, State},
@@ -37,13 +38,17 @@ pub struct AppState {
     /// Signs event payloads with this node's ed25519 key.
     pub signer:          Arc<signing::NodeSigner>,
     /// Hex-encoded ed25519 public key identifying this node in the network.
-    ///
-    /// Used in node-info endpoints and log output; not yet consumed by handlers.
-    #[expect(dead_code, reason = "used in future node-info endpoint")]
     pub node_pubkey_hex: String,
     /// Token required in `X-Admin-Token` for admin endpoints. Empty string means
     /// the token was not configured and all admin calls return 403.
     pub admin_token:     String,
+    /// HTTP client used for push fan-out to peer community nodes.
+    pub push_client:     reqwest::Client,
+    /// In-memory cache of active push peers: pubkey → push URL.
+    ///
+    /// Seeded from `peer_nodes` at startup and updated on `POST /sync/register`.
+    /// The DB is the source of truth; this cache avoids a DB read on every ingest.
+    pub push_subscribers: Arc<RwLock<HashMap<String, String>>>,
 }
 
 // ── ApiError ─────────────────────────────────────────────────────────────────
@@ -89,6 +94,9 @@ impl From<db::DbError> for ApiError {
 /// - `POST /ingest/feed`          — crawler submission; validates via [`verify::VerifierChain`].
 /// - `GET  /sync/events`          — paginated event log for community nodes.
 /// - `POST /sync/reconcile`       — negentropy-style diff for nodes rejoining after downtime.
+/// - `POST /sync/register`        — community nodes announce their push URL here.
+/// - `GET  /sync/peers`           — returns known active peers (primary-as-tracker).
+/// - `GET  /node/info`            — returns this node's pubkey (used for PRIMARY_PUBKEY auto-discovery).
 /// - `POST /admin/artists/merge`  — merge two artist records (requires `X-Admin-Token`).
 /// - `POST /admin/artists/alias`  — register an extra alias for an artist (requires `X-Admin-Token`).
 /// - `GET  /health`               — liveness probe.
@@ -97,6 +105,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/ingest/feed",         post(handle_ingest_feed))
         .route("/sync/events",         get(handle_sync_events))
         .route("/sync/reconcile",      post(handle_sync_reconcile))
+        .route("/sync/register",       post(handle_sync_register))
+        .route("/sync/peers",          get(handle_sync_peers))
+        .route("/node/info",           get(handle_node_info))
         .route("/admin/artists/merge", post(handle_admin_merge_artists))
         .route("/admin/artists/alias", post(handle_admin_add_alias))
         .route("/health",              get(|| async { "ok" }))
@@ -125,7 +136,7 @@ async fn handle_ingest_feed(
     Json(req): Json<ingest::IngestFeedRequest>,
 ) -> Result<Json<ingest::IngestResponse>, ApiError> {
     let state2 = Arc::clone(&state);
-    let result = tokio::task::spawn_blocking(move || -> Result<ingest::IngestResponse, ApiError> {
+    let result = tokio::task::spawn_blocking(move || -> Result<(ingest::IngestResponse, Vec<event::Event>), ApiError> {
         let mut conn = state2.db.lock().unwrap();
 
         // 1. Get existing feed
@@ -145,22 +156,22 @@ async fn handle_ingest_feed(
         // contract can refer to the same value without magic strings.
         let warnings = match state2.chain.run(&ctx) {
             Err(reason) if reason == crate::verifiers::content_hash::NO_CHANGE_SENTINEL => {
-                return Ok(ingest::IngestResponse {
+                return Ok((ingest::IngestResponse {
                     accepted:       true,
                     no_change:      true,
                     reason:         None,
                     events_emitted: vec![],
                     warnings:       vec![],
-                });
+                }, vec![]));
             }
             Err(reason) => {
-                return Ok(ingest::IngestResponse {
+                return Ok((ingest::IngestResponse {
                     accepted:       false,
                     no_change:      false,
                     reason:         Some(reason),
                     events_emitted: vec![],
                     warnings:       vec![],
-                });
+                }, vec![]));
             }
             Ok(w) => w,
         };
@@ -382,22 +393,63 @@ async fn handle_ingest_feed(
             });
         }
 
-        // Collect event_ids before moving event_rows into ingest_transaction
+        // Collect event_ids and snapshot event data before moving event_rows
         let event_ids: Vec<String> = event_rows.iter().map(|r| r.event_id.clone()).collect();
 
+        // Snapshot events for fan-out (built before ingest_transaction moves event_rows)
+        let events_for_fanout: Vec<(String, event::EventType, String, String, String, String, i64, Vec<String>)> =
+            event_rows.iter().map(|r| (
+                r.event_id.clone(),
+                r.event_type.clone(),
+                r.payload_json.clone(),
+                r.subject_guid.clone(),
+                r.signed_by.clone(),
+                r.signature.clone(),
+                r.created_at,
+                r.warnings.clone(),
+            )).collect();
+
         // 10. Run ingest transaction
-        db::ingest_transaction(&mut conn, feed_artist, feed.clone(), track_tuples, event_rows)?;
+        let seqs = db::ingest_transaction(&mut conn, feed_artist, feed.clone(), track_tuples, event_rows)?;
 
         // 11. Update crawl cache
         db::upsert_feed_crawl_cache(&conn, &req.canonical_url, &req.content_hash, now)?;
 
-        Ok(ingest::IngestResponse {
+        // 12. Reconstruct events with assigned seqs for fan-out
+        let fanout_events: Vec<event::Event> = events_for_fanout.into_iter().zip(seqs.iter()).map(
+            |((event_id, event_type, payload_json, subject_guid, signed_by, signature, created_at, warnings), &seq)| {
+                let tagged = format!(r#"{{"type":"{}","data":{payload_json}}}"#,
+                    serde_json::to_string(&event_type)
+                        .unwrap_or_default()
+                        .trim_matches('"')
+                        .to_string()
+                );
+                let payload = serde_json::from_str::<event::EventPayload>(&tagged)
+                    .unwrap_or_else(|_| event::EventPayload::FeedRetired(
+                        event::FeedRetiredPayload { feed_guid: String::new(), reason: None }
+                    ));
+                event::Event {
+                    event_id,
+                    event_type,
+                    payload,
+                    payload_json,
+                    subject_guid,
+                    signed_by,
+                    signature,
+                    seq,
+                    created_at,
+                    warnings,
+                }
+            }
+        ).collect();
+
+        Ok((ingest::IngestResponse {
             accepted:       true,
             no_change:      false,
             reason:         None,
             events_emitted: event_ids,
             warnings,
-        })
+        }, fanout_events))
     })
     .await
     .map_err(|e| ApiError {
@@ -405,7 +457,17 @@ async fn handle_ingest_feed(
         message: format!("internal task panic: {e}"),
     })?;
 
-    result.map(Json)
+    let (response, fanout_events) = result?;
+
+    // Fire-and-forget fan-out to push subscribers.
+    if !fanout_events.is_empty() {
+        let db_fanout          = Arc::clone(&state.db);
+        let client_fanout      = state.push_client.clone();
+        let subscribers_fanout = Arc::clone(&state.push_subscribers);
+        tokio::spawn(fan_out_push(db_fanout, client_fanout, subscribers_fanout, fanout_events));
+    }
+
+    Ok(Json(response))
 }
 
 // ── GET /sync/events ──────────────────────────────────────────────────────────
@@ -512,6 +574,184 @@ async fn handle_sync_reconcile(
         })?;
 
     result.map(Json)
+}
+
+// ── fan_out_push ──────────────────────────────────────────────────────────────
+
+/// Delivers `events` to all registered push subscribers.
+///
+/// Each delivery is a separate `tokio::spawn` so a slow or failing peer does
+/// not block the others. On success the DB `last_push_at` is updated; on
+/// failure the `consecutive_failures` counter is incremented and the peer is
+/// evicted from the in-memory cache when it reaches 5.
+async fn fan_out_push(
+    db:          db::Db,
+    client:      reqwest::Client,
+    subscribers: Arc<RwLock<HashMap<String, String>>>,
+    events:      Vec<event::Event>,
+) {
+    // Snapshot the subscriber map under a brief read lock.
+    let peers: Vec<(String, String)> = {
+        let guard = subscribers.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    };
+
+    let body = sync::PushRequest { events };
+
+    for (pubkey, push_url) in peers {
+        let client2      = client.clone();
+        let db2          = Arc::clone(&db);
+        let subs2        = Arc::clone(&subscribers);
+        let pubkey2      = pubkey.clone();
+        let push_url2    = push_url.clone();
+        let body2        = sync::PushRequest { events: body.events.clone() };
+
+        tokio::spawn(async move {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                .cast_signed();
+
+            let result = client2
+                .post(&push_url2)
+                .json(&body2)
+                .timeout(Duration::from_secs(10))
+                .send()
+                .await;
+
+            match result {
+                Ok(resp) if resp.status().is_success() => {
+                    let conn = db2.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if let Err(e) = db::record_push_success(&conn, &pubkey2, now) {
+                        eprintln!("[fanout] failed to record push success for {pubkey2}: {e}");
+                    }
+                }
+                Ok(resp) => {
+                    eprintln!("[fanout] push to {push_url2} returned HTTP {}", resp.status());
+                    handle_push_failure(&db2, &subs2, &pubkey2);
+                }
+                Err(e) => {
+                    eprintln!("[fanout] push to {push_url2} failed: {e}");
+                    handle_push_failure(&db2, &subs2, &pubkey2);
+                }
+            }
+        });
+    }
+}
+
+/// Increments the failure counter for a peer. Evicts from the in-memory cache
+/// once `consecutive_failures` reaches 5 (DB row kept for re-registration).
+fn handle_push_failure(
+    db:          &db::Db,
+    subscribers: &Arc<RwLock<HashMap<String, String>>>,
+    pubkey:      &str,
+) {
+    let conn = db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Err(e) = db::increment_peer_failures(&conn, pubkey) {
+        eprintln!("[fanout] failed to increment failures for {pubkey}: {e}");
+        return;
+    }
+
+    // Check whether this peer should be evicted from the in-memory cache.
+    let failures: i64 = conn
+        .query_row(
+            "SELECT consecutive_failures FROM peer_nodes WHERE node_pubkey = ?1",
+            rusqlite::params![pubkey],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+
+    if failures >= 5 {
+        let mut guard = subscribers.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.remove(pubkey);
+        eprintln!("[fanout] evicted {pubkey} from push cache after 5 failures");
+    }
+}
+
+// ── POST /sync/register ───────────────────────────────────────────────────────
+
+// Community nodes call this on startup to announce their push URL to the primary.
+async fn handle_sync_register(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<sync::RegisterRequest>,
+) -> Result<Json<sync::RegisterResponse>, ApiError> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .cast_signed();
+
+    let pubkey = req.node_pubkey.clone();
+    let url    = req.node_url.clone();
+
+    let state2 = Arc::clone(&state);
+    tokio::task::spawn_blocking(move || {
+        let conn = state2.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        db::upsert_peer_node(&conn, &pubkey, &url, now)?;
+        db::reset_peer_failures(&conn, &pubkey)?;
+        Ok::<(), db::DbError>(())
+    })
+    .await
+    .map_err(|e| ApiError {
+        status:  StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("internal task panic: {e}"),
+    })?
+    .map_err(ApiError::from)?;
+
+    // Update in-memory cache.
+    {
+        let mut guard = state.push_subscribers.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.insert(req.node_pubkey.clone(), req.node_url.clone());
+    }
+
+    println!("[primary] registered peer {} → {}", req.node_pubkey, req.node_url);
+
+    Ok(Json(sync::RegisterResponse { ok: true }))
+}
+
+// ── GET /sync/peers ───────────────────────────────────────────────────────────
+
+// Returns known active peers (consecutive_failures < 5). This makes the
+// primary its own tracker — community nodes only need the primary URL to
+// bootstrap; the Cloudflare tracker becomes optional.
+async fn handle_sync_peers(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<sync::PeersResponse>, ApiError> {
+    let state2 = Arc::clone(&state);
+    let result = tokio::task::spawn_blocking(move || {
+        let conn  = state2.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let peers = db::get_push_peers(&conn)?;
+        let nodes = peers.into_iter().map(|p| sync::PeerEntry {
+            node_pubkey:  p.node_pubkey,
+            node_url:     p.node_url,
+            last_push_at: p.last_push_at,
+        }).collect();
+        Ok::<sync::PeersResponse, db::DbError>(sync::PeersResponse { nodes })
+    })
+    .await
+    .map_err(|e| ApiError {
+        status:  StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("internal task panic: {e}"),
+    })?
+    .map_err(ApiError::from)?;
+
+    Ok(Json(result))
+}
+
+// ── GET /node/info ────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct NodeInfoResponse {
+    node_pubkey: String,
+}
+
+// Returns this node's ed25519 pubkey. Community nodes call this on startup
+// to auto-discover PRIMARY_PUBKEY without manual configuration.
+async fn handle_node_info(
+    State(state): State<Arc<AppState>>,
+) -> Json<NodeInfoResponse> {
+    Json(NodeInfoResponse { node_pubkey: state.node_pubkey_hex.clone() })
 }
 
 // ── Admin auth helper ─────────────────────────────────────────────────────────

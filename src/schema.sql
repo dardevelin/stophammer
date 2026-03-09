@@ -128,3 +128,11 @@ CREATE TABLE IF NOT EXISTS artist_aliases (
 ) STRICT;
 
 CREATE INDEX IF NOT EXISTS idx_aliases_lower ON artist_aliases(alias_lower);
+
+CREATE TABLE IF NOT EXISTS peer_nodes (
+    node_pubkey          TEXT NOT NULL PRIMARY KEY,
+    node_url             TEXT NOT NULL,
+    discovered_at        INTEGER NOT NULL,
+    last_push_at         INTEGER,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0
+) STRICT;

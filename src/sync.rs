@@ -51,3 +51,44 @@ pub struct ReconcileResponse {
     /// and warrants investigation (e.g. data corruption or a rogue writer).
     pub unknown_to_us: Vec<EventRef>,
 }
+
+/// Body for `POST /sync/push` sent by the primary to peer community nodes.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PushRequest {
+    pub events: Vec<Event>,
+}
+
+/// Response from `POST /sync/push` on community nodes.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PushResponse {
+    pub applied:   usize,
+    pub rejected:  usize,
+    pub duplicate: usize,
+}
+
+/// Body for `POST /sync/register` sent by community nodes to the primary.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct RegisterRequest {
+    pub node_pubkey: String,
+    pub node_url:    String,
+}
+
+/// Response from `POST /sync/register` on the primary.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RegisterResponse {
+    pub ok: bool,
+}
+
+/// Entry in the `GET /sync/peers` response.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PeerEntry {
+    pub node_pubkey: String,
+    pub node_url:    String,
+    pub last_push_at: Option<i64>,
+}
+
+/// Response from `GET /sync/peers` on the primary.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PeersResponse {
+    pub nodes: Vec<PeerEntry>,
+}
