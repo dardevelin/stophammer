@@ -20,9 +20,12 @@ pub struct SyncEventsResponse {
     pub next_seq: i64,
 }
 
-/// POST /sync/reconcile
-/// Negentropy-style diff: node sends what it has, primary returns what it's missing.
-/// Used when a node comes back online after downtime.
+/// Body for `POST /sync/reconcile`.
+///
+/// Implements a negentropy-style set-difference handshake.  The community node
+/// sends the event IDs it already holds (`have`) and the sequence cursor it
+/// diverged from (`since_seq`); the primary returns only what the node is
+/// missing and flags anything in `have` that the primary does not recognise.
 #[derive(Debug, Deserialize)]
 pub struct ReconcileRequest {
     pub node_pubkey: String,
@@ -36,8 +39,15 @@ pub struct EventRef {
     pub seq:      i64,
 }
 
+/// Response to `POST /sync/reconcile`.
 #[derive(Debug, Serialize)]
 pub struct ReconcileResponse {
-    pub send_to_node:  Vec<Event>,     // events the node is missing
-    pub unknown_to_us: Vec<EventRef>,  // node has these, primary doesn't (anomaly)
+    /// Events the requesting node is missing; the node should apply these in order.
+    pub send_to_node:  Vec<Event>,
+    /// Event refs the node reported that the primary does not recognise.
+    ///
+    /// A non-empty list is an anomaly: it means the node has events that never
+    /// passed through this primary, which should not happen in normal operation
+    /// and warrants investigation (e.g. data corruption or a rogue writer).
+    pub unknown_to_us: Vec<EventRef>,
 }
