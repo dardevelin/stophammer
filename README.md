@@ -2,6 +2,16 @@
 
 A quality-gated V4V music index.
 
+## Ecosystem
+
+| Repository | Description |
+|---|---|
+| **[stophammer](https://github.com/dardevelin/stophammer)** | Primary / community node (this repo) |
+| [stophammer-crawler](https://github.com/dardevelin/stophammer-crawler) | RSS feed crawler — one-shot or scheduled |
+| [stophammer-podping](https://github.com/dardevelin/stophammer-podping) | Real-time discovery via the Podping WebSocket stream |
+| [stophammer-importer](https://github.com/dardevelin/stophammer-importer) | Bulk importer from a PodcastIndex SQLite snapshot |
+| [stophammer-tracker](https://github.com/dardevelin/stophammer-tracker) | Cloudflare Workers peer tracker (optional bootstrap) |
+
 ## What it is
 
 Stophammer is a music-centric podcast feed index focused on Value4Value (V4V)
