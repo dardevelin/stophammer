@@ -12,29 +12,36 @@ A quality-gated V4V music index.
 | [stophammer-importer](https://github.com/dardevelin/stophammer-importer) | Bulk importer from a PodcastIndex SQLite snapshot |
 | [stophammer-tracker](https://github.com/dardevelin/stophammer-tracker) | Cloudflare Workers peer tracker (optional bootstrap) |
 
-## What it is
+## The problem
 
-Stophammer is a music-centric podcast feed index focused on Value4Value (V4V)
-payments over the Lightning Network. It crawls and validates RSS feeds that
-declare `podcast:medium=music` and carry valid `podcast:value` payment routes.
+The Lightning Network enables direct music payments — listeners send sats to artists
+as they listen, DJs split payments to the tracks they play. This works beautifully
+*if* you can look up a track and trust that its payment routes are real and working.
 
-Unlike PodcastIndex (and its music subset), Stophammer rejects feeds that do
-not participate in V4V. Every feed in the index has been verified to have
-functional payment routes — at the feed level, and validated per-track where
-declared.
+PodcastIndex is the de-facto feed directory for Podcasting 2.0. It's comprehensive,
+but it doesn't enforce V4V participation — it indexes every podcast regardless of
+whether it has payment routes, whether those routes are valid, or whether it's
+actually music.
 
-## Why it exists
+## What Stophammer is
 
-Tools like **SplitKit** (by Steven Brocklehurst) let DJs and podcasters route
-V4V payments to the artists whose music they play, using `podcast:valueTimeSplit`
-blocks that reference a track's `feedGuid` and `itemGuid`.
+Stophammer is a **verified V4V music index**. It only contains RSS feeds that:
 
-For that to work reliably, you need a lookup source that guarantees:
+- declare `podcast:medium=music`
+- carry at least one working `podcast:value` payment route
 
-1. The feed and track GUIDs are correct and stable
-2. The payment routes on those GUIDs are valid and will actually route sats
+Every entry has been crawled and passed through a verifier chain. The index is an
+**append-only signed event log** — you can verify the integrity of every feed
+addition, replicate the full index to your own node, and serve it locally with no
+dependency on a central server.
 
-PodcastIndex can answer (1). Stophammer answers both.
+## Who it's for
+
+- **App developers** building V4V music players or DJ tools that need a trustworthy
+  source of feed GUIDs and payment routes
+- **Node operators** who want a local, independently-verifiable copy of the index
+- **Contributors** running crawlers (RSS, Podping real-time, or PodcastIndex bulk
+  import) to grow the index
 
 ## Architecture
 
