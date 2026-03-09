@@ -144,7 +144,7 @@ async fn handle_ingest_feed(
         // real rejections. The sentinel is a public const so both sides of this
         // contract can refer to the same value without magic strings.
         let warnings = match state2.chain.run(&ctx) {
-            Err(reason) if reason == verify::NO_CHANGE_SENTINEL => {
+            Err(reason) if reason == crate::verifiers::content_hash::NO_CHANGE_SENTINEL => {
                 return Ok(ingest::IngestResponse {
                     accepted:       true,
                     no_change:      true,

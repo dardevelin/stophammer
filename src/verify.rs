@@ -2,18 +2,35 @@
 
 //! Feed-ingest verification pipeline.
 //!
+//! # Architecture
+//!
 //! [`VerifierChain`] runs a sequence of [`Verifier`] implementations against
 //! an [`IngestContext`]. Each verifier returns [`VerifyResult::Pass`],
-//! [`VerifyResult::Warn`] (accepted but flagged for audit), or
+//! [`VerifyResult::Warn`] (accepted, flagged for audit), or
 //! [`VerifyResult::Fail`] (rejected — stops the chain).
 //!
-//! The built-in verifiers are:
-//! - [`CrawlTokenVerifier`] — gates access to known crawlers.
-//! - [`MediumMusicVerifier`] — rejects non-music feeds.
-//! - [`FeedGuidVerifier`] — rejects known-bad and malformed GUIDs.
-//! - [`PaymentRouteSumVerifier`] — rejects tracks with splits ≠ 100.
-//! - [`ContentHashVerifier`] — short-circuits unchanged feeds via [`NO_CHANGE_SENTINEL`].
-//! - [`EnclosureTypeVerifier`] — warns on video enclosure MIME types.
+//! # Adding a new verifier (plugin pattern)
+//!
+//! 1. Create `src/verifiers/<name>.rs` implementing the [`Verifier`] trait.
+//! 2. Add the module to `src/verifiers/mod.rs`.
+//! 3. Add a `match` arm to [`build_chain`] mapping the name string to the struct.
+//! 4. Set `VERIFIER_CHAIN` to include the new name.
+//!
+//! No other files need to change. The chain order, and which verifiers run,
+//! is controlled entirely by the `VERIFIER_CHAIN` environment variable at
+//! startup — no redeployment of other nodes is required when adding verifiers
+//! to a primary node.
+//!
+//! # Built-in verifiers
+//!
+//! | Name | Module | Function |
+//! |---|---|---|
+//! | `crawl_token` | [`verifiers::crawl_token`] | Rejects invalid crawl tokens |
+//! | `medium_music` | [`verifiers::medium_music`] | Rejects non-music `podcast:medium` |
+//! | `feed_guid` | [`verifiers::feed_guid`] | Rejects bad/malformed GUIDs |
+//! | `payment_route_sum` | [`verifiers::payment_route_sum`] | Rejects splits ≠ 100 |
+//! | `content_hash` | [`verifiers::content_hash`] | Short-circuits unchanged feeds |
+//! | `enclosure_type` | [`verifiers::enclosure_type`] | Warns on video MIME types |
 
 use rusqlite::Connection;
 use crate::ingest::IngestFeedRequest;
@@ -51,13 +68,34 @@ pub enum VerifyResult {
 
 // ── Trait ──────────────────────────────────────────────────────────────────
 
+/// A single step in the verifier chain.
+///
+/// # Implementing a verifier
+///
+/// ```rust,ignore
+/// use stophammer::verify::{IngestContext, Verifier, VerifyResult};
+///
+/// pub struct MyVerifier;
+///
+/// impl Verifier for MyVerifier {
+///     fn name(&self) -> &'static str { "my_verifier" }
+///
+///     fn verify(&self, ctx: &IngestContext) -> VerifyResult {
+///         // inspect ctx.request or ctx.db, return Pass/Warn/Fail
+///         VerifyResult::Pass
+///     }
+/// }
+/// ```
 pub trait Verifier: Send + Sync {
+    /// Short identifier used in warning and rejection messages, e.g. `"crawl_token"`.
     fn name(&self) -> &'static str;
+    /// Run this check against `ctx` and return the outcome.
     fn verify(&self, ctx: &IngestContext) -> VerifyResult;
 }
 
 // ── Chain ──────────────────────────────────────────────────────────────────
 
+/// An ordered sequence of [`Verifier`]s run against each ingest request.
 pub struct VerifierChain {
     verifiers: Vec<Box<dyn Verifier>>,
 }
@@ -70,15 +108,16 @@ impl VerifierChain {
 
     /// Runs all verifiers in order and collects warnings.
     ///
-    /// Returns `Ok(warnings)` when all verifiers pass or warn.  Stops at the
+    /// Returns `Ok(warnings)` when all verifiers pass or warn. Stops at the
     /// first [`VerifyResult::Fail`] and returns `Err(reason)`.
     ///
     /// # Errors
     ///
     /// Returns the formatted rejection reason on the first `Fail`.
-    /// Note: [`ContentHashVerifier`] uses [`NO_CHANGE_SENTINEL`] as the
-    /// rejection string to signal a no-op rather than a true error — callers
-    /// must distinguish this sentinel from a real failure.
+    /// [`verifiers::content_hash::ContentHashVerifier`] uses
+    /// [`verifiers::content_hash::NO_CHANGE_SENTINEL`] as its rejection string
+    /// to signal a no-op — callers must check for this sentinel before treating
+    /// the error as a real failure.
     pub fn run(&self, ctx: &IngestContext) -> Result<Vec<String>, String> {
         let mut warnings = Vec::new();
         for v in &self.verifiers {
@@ -92,144 +131,83 @@ impl VerifierChain {
     }
 }
 
-// ── Built-in verifiers ─────────────────────────────────────────────────────
+// ── ChainSpec ──────────────────────────────────────────────────────────────
 
-/// Rejects requests with an invalid crawl token.
-pub struct CrawlTokenVerifier {
-    pub expected: String,
-}
-
-impl Verifier for CrawlTokenVerifier {
-    fn name(&self) -> &'static str { "crawl_token" }
-
-    fn verify(&self, ctx: &IngestContext) -> VerifyResult {
-        if ctx.request.crawl_token == self.expected {
-            VerifyResult::Pass
-        } else {
-            VerifyResult::Fail("invalid crawl token".into())
-        }
-    }
-}
-
-/// Rejects feeds where podcast:medium is not "music".
-/// Warns (does not fail) when medium is absent — allows inference-based
-/// ingestion while flagging it for review.
-pub struct MediumMusicVerifier;
-
-impl Verifier for MediumMusicVerifier {
-    fn name(&self) -> &'static str { "medium_music" }
-
-    fn verify(&self, ctx: &IngestContext) -> VerifyResult {
-        match ctx.request.feed_data.as_ref().and_then(|f| f.raw_medium.as_deref()) {
-            Some("music") => VerifyResult::Pass,
-            Some(other)   => VerifyResult::Fail(format!("medium is '{other}', not 'music'")),
-            None          => VerifyResult::Warn("podcast:medium absent — inferred as music".into()),
-        }
-    }
-}
-
-/// Rejects known bad/placeholder podcast:guid values and malformed UUIDs.
-pub struct FeedGuidVerifier;
-
-/// GUIDs shared by thousands of unrelated feeds (platform defaults).
+/// Configuration that drives chain assembly at startup.
 ///
-/// Feeds presenting one of these GUIDs are rejected. Add new entries as they
-/// are discovered in the wild.
-const BAD_GUIDS: &[&str] = &[
-    "c9c7bad3-4712-514e-9ebd-d1e208fa1b76",
-];
+/// Read from environment variables so operators can change the verifier set
+/// and order without modifying code.
+///
+/// # Environment variables
+///
+/// - `VERIFIER_CHAIN` — comma-separated list of verifier names, in run order.
+///   Defaults to the full built-in set in a sensible order.
+///   Example: `"crawl_token,content_hash,medium_music,feed_guid,payment_route_sum,enclosure_type"`
+pub struct ChainSpec {
+    /// Names of verifiers to run, in order.
+    pub names: Vec<String>,
+}
 
-impl Verifier for FeedGuidVerifier {
-    fn name(&self) -> &'static str { "feed_guid" }
+impl ChainSpec {
+    /// Default chain: all built-ins in the recommended order.
+    pub const DEFAULT: &'static str =
+        "crawl_token,content_hash,medium_music,feed_guid,payment_route_sum,enclosure_type";
 
-    fn verify(&self, ctx: &IngestContext) -> VerifyResult {
-        let Some(guid) = ctx.request.feed_data.as_ref().map(|f| f.feed_guid.as_str()) else {
-            return VerifyResult::Pass; // fetch failed — handled elsewhere
-        };
-        if BAD_GUIDS.contains(&guid) {
-            return VerifyResult::Fail(format!("known bad guid: {guid}"));
+    /// Reads `VERIFIER_CHAIN` from the environment.
+    ///
+    /// Falls back to [`Self::DEFAULT`] when the variable is absent or empty.
+    pub fn from_env() -> Self {
+        let raw = std::env::var("VERIFIER_CHAIN").unwrap_or_default();
+        let raw = if raw.trim().is_empty() { Self::DEFAULT.to_string() } else { raw };
+        Self {
+            names: raw.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
         }
-        if uuid::Uuid::parse_str(guid).is_err() {
-            return VerifyResult::Fail(format!("invalid uuid: {guid}"));
-        }
-        VerifyResult::Pass
     }
 }
 
-/// Rejects if payment route splits for any track do not sum to 100.
-pub struct PaymentRouteSumVerifier;
+// ── Registry ───────────────────────────────────────────────────────────────
 
-impl Verifier for PaymentRouteSumVerifier {
-    fn name(&self) -> &'static str { "payment_route_sum" }
+/// Assembles a [`VerifierChain`] from a [`ChainSpec`].
+///
+/// Maps each name in `spec.names` to its built-in [`Verifier`] implementation.
+/// Unknown names are logged and skipped — they do not abort startup.
+///
+/// `crawl_token` requires the shared secret from `CRAWL_TOKEN`; pass it via
+/// the `crawl_token` argument so this function does not read env vars itself.
+///
+/// # Adding a new verifier
+///
+/// Add a `match` arm below and declare it in `src/verifiers/mod.rs`. No other
+/// files need to change. See the [module-level docs](self) for the full
+/// four-step procedure.
+pub fn build_chain(spec: &ChainSpec, crawl_token: String) -> VerifierChain {
+    use crate::verifiers::{
+        content_hash::ContentHashVerifier,
+        crawl_token::CrawlTokenVerifier,
+        enclosure_type::EnclosureTypeVerifier,
+        feed_guid::FeedGuidVerifier,
+        medium_music::MediumMusicVerifier,
+        payment_route_sum::PaymentRouteSumVerifier,
+    };
 
-    fn verify(&self, ctx: &IngestContext) -> VerifyResult {
-        let Some(feed_data) = &ctx.request.feed_data else {
-            return VerifyResult::Pass;
-        };
-        for track in &feed_data.tracks {
-            if track.payment_routes.is_empty() {
+    let mut verifiers: Vec<Box<dyn Verifier>> = Vec::new();
+
+    for name in &spec.names {
+        let v: Box<dyn Verifier> = match name.as_str() {
+            "crawl_token"       => Box::new(CrawlTokenVerifier { expected: crawl_token.clone() }),
+            "content_hash"      => Box::new(ContentHashVerifier),
+            "medium_music"      => Box::new(MediumMusicVerifier),
+            "feed_guid"         => Box::new(FeedGuidVerifier),
+            "payment_route_sum" => Box::new(PaymentRouteSumVerifier),
+            "enclosure_type"    => Box::new(EnclosureTypeVerifier),
+            unknown => {
+                // TODO(logging): replace eprintln! with structured tracing once tracing crate is added
+                eprintln!("[verifier_chain] unknown verifier '{unknown}' in VERIFIER_CHAIN — skipping");
                 continue;
             }
-            let sum: i64 = track.payment_routes.iter().map(|r| r.split).sum();
-            if sum != 100 {
-                return VerifyResult::Fail(format!(
-                    "track '{}' payment splits sum to {sum} (expected 100)",
-                    track.track_guid
-                ));
-            }
-        }
-        VerifyResult::Pass
-    }
-}
-
-/// Returns a sentinel `Fail("NO_CHANGE")` if the content hash is identical
-/// to the last crawl. The ingest handler treats `NO_CHANGE` as a no-op,
-/// not a real error.
-pub struct ContentHashVerifier;
-
-pub const NO_CHANGE_SENTINEL: &str = "NO_CHANGE";
-
-impl Verifier for ContentHashVerifier {
-    fn name(&self) -> &'static str { "content_hash" }
-
-    fn verify(&self, ctx: &IngestContext) -> VerifyResult {
-        let last_hash: Option<String> = ctx.db
-            .query_row(
-                "SELECT content_hash FROM feed_crawl_cache WHERE feed_url = ?1",
-                [&ctx.request.canonical_url],
-                |row| row.get(0),
-            )
-            .ok();
-
-        match last_hash {
-            Some(h) if h == ctx.request.content_hash => {
-                VerifyResult::Fail(NO_CHANGE_SENTINEL.into())
-            }
-            _ => VerifyResult::Pass,
-        }
-    }
-}
-
-/// Warns if any track enclosure MIME type looks like video rather than audio.
-pub struct EnclosureTypeVerifier;
-
-impl Verifier for EnclosureTypeVerifier {
-    fn name(&self) -> &'static str { "enclosure_type" }
-
-    fn verify(&self, ctx: &IngestContext) -> VerifyResult {
-        let Some(feed_data) = &ctx.request.feed_data else {
-            return VerifyResult::Pass;
         };
-        for track in &feed_data.tracks {
-            if let Some(mime) = &track.enclosure_type {
-                if mime.starts_with("video/") {
-                    return VerifyResult::Warn(format!(
-                        "track '{}' has video enclosure type '{mime}'",
-                        track.track_guid
-                    ));
-                }
-            }
-        }
-        VerifyResult::Pass
+        verifiers.push(v);
     }
+
+    VerifierChain::new(verifiers)
 }

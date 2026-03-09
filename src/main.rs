@@ -14,23 +14,7 @@ mod model;
 mod signing;
 mod sync;
 mod verify;
-
-use verify::{
-    CrawlTokenVerifier, ContentHashVerifier, EnclosureTypeVerifier,
-    FeedGuidVerifier, MediumMusicVerifier, PaymentRouteSumVerifier,
-    VerifierChain,
-};
-
-fn build_verifier_chain(crawl_token: String) -> VerifierChain {
-    VerifierChain::new(vec![
-        Box::new(CrawlTokenVerifier { expected: crawl_token }),
-        Box::new(MediumMusicVerifier),
-        Box::new(FeedGuidVerifier),
-        Box::new(PaymentRouteSumVerifier),
-        Box::new(ContentHashVerifier),
-        Box::new(EnclosureTypeVerifier),
-    ])
-}
+mod verifiers;
 
 #[tokio::main]
 async fn main() {
@@ -61,7 +45,7 @@ async fn run_primary(
     let crawl_token = std::env::var("CRAWL_TOKEN").expect("CRAWL_TOKEN env var required");
     // ADMIN_TOKEN is optional: if absent, all admin endpoints return 403.
     let admin_token = std::env::var("ADMIN_TOKEN").unwrap_or_default();
-    let chain = build_verifier_chain(crawl_token);
+    let chain = verify::build_chain(&verify::ChainSpec::from_env(), crawl_token);
 
     let state = std::sync::Arc::new(api::AppState {
         db,
@@ -113,8 +97,8 @@ async fn run_community(
     // Serve the read-only API (no ingest, no reconcile write-path).
     // We still need an AppState; the signer is present but will never be called
     // because the read-only router does not expose ingest or reconcile routes.
-    // A dummy verifier chain is used since the community node does not ingest.
-    let dummy_chain = build_verifier_chain(String::new());
+    // Empty chain: community nodes do not run ingest, so no verifiers are needed.
+    let dummy_chain = verify::VerifierChain::new(vec![]);
     let state = std::sync::Arc::new(api::AppState {
         db,
         chain:           std::sync::Arc::new(dummy_chain),
