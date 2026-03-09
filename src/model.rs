@@ -39,6 +39,7 @@ pub struct Feed {
     pub oldest_item_at: Option<i64>,
     pub created_at:     i64,
     pub updated_at:     i64,
+    /// Verbatim value of the `podcast:medium` tag from the RSS feed, if present.
     pub raw_medium:     Option<String>,
 }
 
@@ -49,6 +50,7 @@ pub struct Track {
     pub feed_guid:       String,
     pub artist_id:       String,
     pub title:           String,
+    /// Pre-lowercased copy of `title` used for case-insensitive search queries.
     pub title_lower:     String,
     pub pub_date:        Option<i64>,
     pub duration_secs:   Option<i64>,
@@ -81,12 +83,14 @@ pub struct PaymentRoute {
     pub custom_key:     Option<String>,
     pub custom_value:   Option<String>,
     pub split:          i64,
+    /// When `true`, this recipient is an app-fee destination, not an artist split.
     pub fee:            bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValueTimeSplit {
     pub id:                Option<i64>,
+    /// GUID of the track whose playback triggers this split.
     pub source_track_guid: String,
     pub start_time_secs:   i64,
     pub duration_secs:     Option<i64>,

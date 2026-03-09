@@ -20,8 +20,11 @@ pub type Db = Arc<Mutex<Connection>>;
 
 // ── Errors ──────────────────────────────────────────────────────────────────
 
+/// Errors returned by all database operations in this module.
 pub enum DbError {
+    /// A rusqlite operation failed (query, execute, or schema application).
     Rusqlite(rusqlite::Error),
+    /// A JSON serialisation or deserialisation step failed.
     Json(serde_json::Error),
 }
 
@@ -63,14 +66,23 @@ impl std::error::Error for DbError {
 
 // ── EventRow ─────────────────────────────────────────────────────────────────
 
+/// A pre-assembled event ready to be written to the `events` table.
 pub struct EventRow {
+    /// Globally unique identifier for this event (UUID v4).
     pub event_id:     String,
+    /// Discriminant describing the kind of state change this event records.
     pub event_type:   EventType,
+    /// Canonical JSON representation of the event-specific payload.
     pub payload_json: String,
+    /// GUID of the primary entity this event concerns (feed, track, etc.).
     pub subject_guid: String,
+    /// Hex-encoded ed25519 public key of the node that signed this event.
     pub signed_by:    String,
+    /// Hex-encoded ed25519 signature over the canonical signing payload.
     pub signature:    String,
+    /// Unix timestamp (seconds) at which the event was created.
     pub created_at:   i64,
+    /// Human-readable warnings produced by the verifier chain, if any.
     pub warnings:     Vec<String>,
 }
 
@@ -80,6 +92,12 @@ const SCHEMA: &str = include_str!("schema.sql");
 
 // ── open_db ──────────────────────────────────────────────────────────────────
 
+/// Opens the `SQLite` database at `path` and applies the bundled schema.
+///
+/// # Panics
+///
+/// Panics if the file cannot be opened (e.g. permission denied) or if the
+/// schema SQL fails to execute. Both are unrecoverable startup failures.
 pub fn open_db(path: &str) -> Connection {
     let conn = Connection::open(path).expect("failed to open database");
     conn.execute_batch(SCHEMA).expect("failed to apply schema");
@@ -101,6 +119,11 @@ fn event_type_str(et: &EventType) -> Result<String, DbError> {
 
 // ── resolve_artist ────────────────────────────────────────────────────────────
 
+/// Returns an existing artist matched by lowercased `name`, or inserts a new one.
+///
+/// # Errors
+///
+/// Returns [`DbError::Rusqlite`] if any SQL operation fails.
 pub fn resolve_artist(conn: &Connection, name: &str) -> Result<Artist, DbError> {
     let name_lower = name.to_lowercase();
 
@@ -139,8 +162,13 @@ pub fn resolve_artist(conn: &Connection, name: &str) -> Result<Artist, DbError> 
 // ── upsert_artist_if_absent ───────────────────────────────────────────────────
 
 /// Inserts the artist if no row with the same `artist_id` exists yet.
+///
 /// Used by the community node to replay `ArtistUpserted` events without
 /// overwriting locally-resolved `created_at` timestamps.
+///
+/// # Errors
+///
+/// Returns [`DbError::Rusqlite`] if the SQL `INSERT OR IGNORE` fails.
 pub fn upsert_artist_if_absent(conn: &Connection, artist: &Artist) -> Result<(), DbError> {
     conn.execute(
         "INSERT OR IGNORE INTO artists (artist_id, name, name_lower, created_at) \
@@ -152,6 +180,11 @@ pub fn upsert_artist_if_absent(conn: &Connection, artist: &Artist) -> Result<(),
 
 // ── upsert_feed ───────────────────────────────────────────────────────────────
 
+/// Inserts or updates a feed row keyed on `feed_guid`.
+///
+/// # Errors
+///
+/// Returns [`DbError::Rusqlite`] if the SQL upsert fails.
 pub fn upsert_feed(conn: &Connection, feed: &Feed) -> Result<(), DbError> {
     conn.execute(
         "INSERT INTO feeds (feed_guid, feed_url, title, title_lower, artist_id, description, image_url, \
@@ -197,6 +230,11 @@ pub fn upsert_feed(conn: &Connection, feed: &Feed) -> Result<(), DbError> {
 
 // ── upsert_track ──────────────────────────────────────────────────────────────
 
+/// Inserts or updates a track row keyed on `track_guid`.
+///
+/// # Errors
+///
+/// Returns [`DbError::Rusqlite`] if the SQL upsert fails.
 pub fn upsert_track(conn: &Connection, track: &Track) -> Result<(), DbError> {
     conn.execute(
         "INSERT INTO tracks (track_guid, feed_guid, artist_id, title, title_lower, pub_date, \
@@ -242,6 +280,12 @@ pub fn upsert_track(conn: &Connection, track: &Track) -> Result<(), DbError> {
 
 // ── replace_payment_routes ────────────────────────────────────────────────────
 
+/// Deletes all payment routes for `track_guid` and inserts the new `routes`.
+///
+/// # Errors
+///
+/// Returns [`DbError::Rusqlite`] if any SQL operation fails, or
+/// [`DbError::Json`] if a `route_type` variant cannot be serialised.
 pub fn replace_payment_routes(
     conn: &Connection,
     track_guid: &str,
@@ -273,6 +317,11 @@ pub fn replace_payment_routes(
 
 // ── replace_value_time_splits ─────────────────────────────────────────────────
 
+/// Deletes all value-time splits for `source_track_guid` and inserts `splits`.
+///
+/// # Errors
+///
+/// Returns [`DbError::Rusqlite`] if any SQL operation fails.
 pub fn replace_value_time_splits(
     conn: &Connection,
     source_track_guid: &str,
@@ -303,6 +352,12 @@ pub fn replace_value_time_splits(
 
 // ── insert_event ──────────────────────────────────────────────────────────────
 
+/// Inserts a single event row and returns the assigned monotonic `seq`.
+///
+/// # Errors
+///
+/// Returns [`DbError::Json`] if `event_type` or `warnings` cannot be
+/// serialised, or [`DbError::Rusqlite`] if the SQL insert fails.
 #[expect(clippy::too_many_arguments, reason = "all fields are required for a complete event row")]
 pub fn insert_event(
     conn:         &Connection,
@@ -334,6 +389,11 @@ pub fn insert_event(
 
 // ── upsert_feed_crawl_cache ───────────────────────────────────────────────────
 
+/// Records the latest content hash and crawl timestamp for `feed_url`.
+///
+/// # Errors
+///
+/// Returns [`DbError::Rusqlite`] if the SQL upsert fails.
 pub fn upsert_feed_crawl_cache(
     conn:         &Connection,
     feed_url:     &str,
@@ -353,6 +413,13 @@ pub fn upsert_feed_crawl_cache(
 
 // ── get_events_since ──────────────────────────────────────────────────────────
 
+/// Returns up to `limit` events with `seq > after_seq`, ordered ascending.
+///
+/// # Errors
+///
+/// Returns [`DbError::Rusqlite`] if the query fails, or [`DbError::Json`] if
+/// any stored `event_type`, `payload_json`, or `warnings_json` cannot be
+/// deserialised.
 pub fn get_events_since(
     conn:       &Connection,
     after_seq:  i64,
@@ -406,6 +473,11 @@ pub fn get_events_since(
 
 // ── get_event_refs_since ──────────────────────────────────────────────────────
 
+/// Returns lightweight `(event_id, seq)` references for all events with `seq >= since_seq`.
+///
+/// # Errors
+///
+/// Returns [`DbError::Rusqlite`] if the query or row mapping fails.
 pub fn get_event_refs_since(
     conn:      &Connection,
     since_seq: i64,
@@ -430,6 +502,11 @@ pub fn get_event_refs_since(
 
 // ── upsert_node_sync_state ────────────────────────────────────────────────────
 
+/// Records or updates the last-seen sequence number for a peer node.
+///
+/// # Errors
+///
+/// Returns [`DbError::Rusqlite`] if the SQL upsert fails.
 pub fn upsert_node_sync_state(
     conn:         &Connection,
     node_pubkey:  &str,
@@ -449,7 +526,11 @@ pub fn upsert_node_sync_state(
 
 // ── get_node_sync_cursor ──────────────────────────────────────────────────────
 
-/// Returns the `last_seq` cursor stored for `node_pubkey`, or 0 if none exists.
+/// Returns the `last_seq` cursor stored for `node_pubkey`, or `0` if none exists.
+///
+/// # Errors
+///
+/// Returns [`DbError::Rusqlite`] if the query fails.
 pub fn get_node_sync_cursor(conn: &Connection, node_pubkey: &str) -> Result<i64, DbError> {
     let seq: Option<i64> = conn.query_row(
         "SELECT last_seq FROM node_sync_state WHERE node_pubkey = ?1",
@@ -461,6 +542,11 @@ pub fn get_node_sync_cursor(conn: &Connection, node_pubkey: &str) -> Result<i64,
 
 // ── get_existing_feed ─────────────────────────────────────────────────────────
 
+/// Looks up the feed row whose `feed_url` matches, returning `None` if absent.
+///
+/// # Errors
+///
+/// Returns [`DbError::Rusqlite`] if the query or row mapping fails.
 pub fn get_existing_feed(
     conn:     &Connection,
     feed_url: &str,
@@ -505,6 +591,18 @@ pub fn get_existing_feed(
 // `&Transaction` handle so all writes participate in the same atomic commit.
 // Extracting shared SQL into `const` strings would add complexity for no
 // safety benefit; the duplication is localised here and should stay.
+/// Writes a complete feed ingest atomically and returns the new event `seq` values.
+///
+/// Upserts the artist, feed, all tracks (with payment routes and value-time
+/// splits), and inserts the supplied event rows — all inside one `SQLite`
+/// transaction. Returns the monotonically assigned `seq` for each event in
+/// the same order as `event_rows`.
+///
+/// # Errors
+///
+/// Returns [`DbError::Rusqlite`] if any SQL operation fails (the transaction
+/// is automatically rolled back), or [`DbError::Json`] if an `event_type` or
+/// `route_type` variant cannot be serialised.
 #[expect(clippy::too_many_lines, reason = "single atomic transaction — splitting would obscure the transactional boundary")]
 #[expect(clippy::needless_pass_by_value, reason = "takes ownership to make the transaction boundary clear at call sites")]
 pub fn ingest_transaction(

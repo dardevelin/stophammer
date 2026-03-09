@@ -28,17 +28,25 @@ use crate::{db, event, ingest, model, signing, sync, verify};
 
 // ── AppState ────────────────────────────────────────────────────────────────
 
+/// Shared application state injected into every Axum handler.
 pub struct AppState {
+    /// `SQLite` database handle (mutex-wrapped for blocking-task access).
     pub db:              db::Db,
+    /// Ordered chain of verifiers that must all pass before an ingest is accepted.
     pub chain:           Arc<verify::VerifierChain>,
+    /// Signs event payloads with this node's ed25519 key.
     pub signer:          Arc<signing::NodeSigner>,
+    /// Hex-encoded ed25519 public key identifying this node in the network.
     pub node_pubkey_hex: String,
 }
 
 // ── ApiError ─────────────────────────────────────────────────────────────────
 
+/// HTTP error response returned by all handlers; serializes to `{"error":"..."}`.
 pub struct ApiError {
+    /// HTTP status code sent to the client.
     pub status:  StatusCode,
+    /// Human-readable error message included in the JSON body.
     pub message: String,
 }
 
@@ -69,6 +77,13 @@ impl From<db::DbError> for ApiError {
 
 // ── Router ────────────────────────────────────────────────────────────────────
 
+/// Builds the full read-write router used by the primary node.
+///
+/// Routes exposed:
+/// - `POST /ingest/feed` — crawler submission; validates via [`verify::VerifierChain`].
+/// - `GET  /sync/events` — paginated event log for community nodes.
+/// - `POST /sync/reconcile` — negentropy-style diff for nodes rejoining after downtime.
+/// - `GET  /health` — liveness probe.
 pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/ingest/feed",    post(handle_ingest_feed))
@@ -92,6 +107,8 @@ pub fn build_readonly_router(state: Arc<AppState>) -> Router {
 
 // ── POST /ingest/feed ─────────────────────────────────────────────────────────
 
+// Flow: verify crawl_token → run VerifierChain → resolve artist → build event rows
+// → spawn_blocking DB transaction → return IngestResponse.
 #[expect(clippy::too_many_lines, reason = "single ingest flow — splitting would obscure the sequential validation steps")]
 async fn handle_ingest_feed(
     State(state): State<Arc<AppState>>,
@@ -383,6 +400,7 @@ async fn handle_ingest_feed(
 
 // ── GET /sync/events ──────────────────────────────────────────────────────────
 
+// Query parameters for GET /sync/events; `after_seq` defaults to 0 (fetch from start).
 #[derive(serde::Deserialize)]
 struct SyncEventsQuery {
     #[serde(default)]
@@ -390,6 +408,8 @@ struct SyncEventsQuery {
     limit:     Option<i64>,
 }
 
+// Flow: parse query params → cap limit at 1000 → spawn_blocking DB read
+// → return SyncEventsResponse with pagination cursor.
 async fn handle_sync_events(
     State(state): State<Arc<AppState>>,
     Query(params): Query<SyncEventsQuery>,
@@ -422,6 +442,8 @@ async fn handle_sync_events(
 
 // ── POST /sync/reconcile ──────────────────────────────────────────────────────
 
+// Flow: compute set-difference between node's `have` list and our refs →
+// return events the node is missing; surface any IDs unknown to us as anomalies.
 async fn handle_sync_reconcile(
     State(state): State<Arc<AppState>>,
     Json(req): Json<sync::ReconcileRequest>,

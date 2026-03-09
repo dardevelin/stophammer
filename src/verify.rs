@@ -21,18 +21,28 @@ use crate::model::Feed;
 
 // ── Context ────────────────────────────────────────────────────────────────
 
+/// Contextual data threaded through the verifier chain for a single ingest request.
 pub struct IngestContext<'a> {
+    /// The ingest request being validated, including the parsed feed data.
     pub request:  &'a IngestFeedRequest,
+    /// Read-only view of the database, used by verifiers that need prior state.
     pub db:       &'a Connection,
+    /// The feed row already stored for this URL, if one exists.
     pub existing: Option<&'a Feed>,
 }
 
 // ── Result ─────────────────────────────────────────────────────────────────
 
+/// The outcome of a single verifier step.
 pub enum VerifyResult {
+    /// The check passed; ingestion continues normally.
     Pass,
-    Warn(String),  // accepted, flagged — stored with event for audit
-    Fail(String),  // rejected — reason returned to crawler
+    /// The check raised a concern but did not block ingestion; the message is
+    /// stored with the event record for later audit.
+    Warn(String),
+    /// The check failed; ingestion is rejected and the message is returned
+    /// to the crawler as the rejection reason.
+    Fail(String),
 }
 
 // ── Trait ──────────────────────────────────────────────────────────────────
@@ -49,11 +59,22 @@ pub struct VerifierChain {
 }
 
 impl VerifierChain {
+    /// Creates a new chain that will run `verifiers` in order.
     pub fn new(verifiers: Vec<Box<dyn Verifier>>) -> Self {
         Self { verifiers }
     }
 
-    /// Returns Ok(warnings) on success, Err(reason) on first Fail.
+    /// Runs all verifiers in order and collects warnings.
+    ///
+    /// Returns `Ok(warnings)` when all verifiers pass or warn.  Stops at the
+    /// first [`VerifyResult::Fail`] and returns `Err(reason)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the formatted rejection reason on the first `Fail`.
+    /// Note: [`ContentHashVerifier`] uses [`NO_CHANGE_SENTINEL`] as the
+    /// rejection string to signal a no-op rather than a true error — callers
+    /// must distinguish this sentinel from a real failure.
     pub fn run(&self, ctx: &IngestContext) -> Result<Vec<String>, String> {
         let mut warnings = Vec::new();
         for v in &self.verifiers {
@@ -106,8 +127,10 @@ impl Verifier for MediumMusicVerifier {
 /// Rejects known bad/placeholder podcast:guid values and malformed UUIDs.
 pub struct FeedGuidVerifier;
 
-// GUIDs shared by thousands of unrelated feeds (platform defaults).
-// Add to this list as new ones are discovered.
+/// GUIDs shared by thousands of unrelated feeds (platform defaults).
+///
+/// Feeds presenting one of these GUIDs are rejected. Add new entries as they
+/// are discovered in the wild.
 const BAD_GUIDS: &[&str] = &[
     "c9c7bad3-4712-514e-9ebd-d1e208fa1b76",
 ];

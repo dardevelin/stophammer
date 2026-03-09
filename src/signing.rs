@@ -16,13 +16,19 @@ use rand_core::OsRng;
 use sha2::{Sha256, Digest};
 use crate::event::{EventSigningPayload, EventType, Event};
 
+/// Holds the node's ed25519 signing key and its hex-encoded public key.
 pub struct NodeSigner {
     signing_key: SigningKey,
     pubkey_hex:  String,
 }
 
+/// Errors returned by key-management and signature-verification operations.
 pub enum SigningError {
+    /// An I/O error occurred reading or writing the key file, or decoding
+    /// a hex-encoded public key or signature from an event.
     Io(std::io::Error),
+    /// The ed25519 key material is structurally invalid, or the signature
+    /// does not verify against the reconstructed signing payload.
     InvalidKey(ed25519_dalek::SignatureError),
 }
 
@@ -63,6 +69,16 @@ impl std::error::Error for SigningError {
 }
 
 impl NodeSigner {
+    /// Loads a 32-byte ed25519 signing key from `path`, or generates one on first run.
+    ///
+    /// A newly generated key is written to `path` with Unix permissions 0o600.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SigningError::Io`] if the key file cannot be read, written,
+    /// or if the file does not contain exactly 32 bytes (the raw bytes are
+    /// `try_into`-converted and the length mismatch is mapped to an
+    /// `InvalidData` I/O error).
     pub fn load_or_create(path: &str) -> Result<Self, SigningError> {
         let signing_key = if std::path::Path::new(path).exists() {
             let bytes = std::fs::read(path)?;
@@ -88,10 +104,20 @@ impl NodeSigner {
         Ok(Self { signing_key, pubkey_hex })
     }
 
+    /// Returns the hex-encoded ed25519 public key for this node.
     pub fn pubkey_hex(&self) -> &str {
         &self.pubkey_hex
     }
 
+    /// Signs the event fields and returns `(pubkey_hex, signature_hex)`.
+    ///
+    /// The signature covers SHA-256 of the canonical JSON serialisation of
+    /// [`EventSigningPayload`] built from the supplied fields.
+    ///
+    /// # Panics
+    ///
+    /// Panics if [`EventSigningPayload`] cannot be serialised to JSON. This
+    /// is a programming error — the type is always serialisable.
     pub fn sign_event(
         &self,
         event_id:     &str,
@@ -114,6 +140,18 @@ impl NodeSigner {
     }
 }
 
+/// Verifies the ed25519 signature on `event` using the pubkey in `event.signed_by`.
+///
+/// This is a free function rather than a `NodeSigner` method because it
+/// verifies events signed by *any* node — it does not require access to
+/// this node's private key.
+///
+/// # Errors
+///
+/// Returns [`SigningError::Io`] if `event.signed_by` or `event.signature`
+/// are not valid hex, or if either decodes to the wrong byte length.
+/// Returns [`SigningError::InvalidKey`] if the public key bytes are
+/// structurally invalid or if the signature does not verify.
 pub fn verify_event_signature(event: &Event) -> Result<(), SigningError> {
     let pubkey_bytes = hex::decode(&event.signed_by)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
