@@ -54,6 +54,18 @@ pub enum EventPayload {
 }
 
 /// The full signed event — the sync primitive between all nodes.
+///
+/// `payload_json` carries the canonical inner-payload JSON string that was
+/// used when computing the ed25519 signature. It is **not** included in the
+/// wire representation (`#[serde(skip)]`) because the typed `payload` field
+/// already covers the content; it exists solely so `verify_event_signature`
+/// can hash exactly the same bytes that were signed, without re-serializing
+/// through `serde_json::Value` (which sorts object keys alphabetically and
+/// would produce a different digest).
+///
+/// Callers that construct `Event` from the wire (community sync) must populate
+/// `payload_json` using [`Event::payload_json_from_payload`] before calling
+/// `verify_event_signature`.
 #[expect(clippy::struct_field_names, reason = "event_id and event_type are canonical field names in the protocol")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
@@ -66,6 +78,13 @@ pub struct Event {
     pub seq:          i64,          // monotonic, assigned by primary at commit
     pub created_at:   i64,          // unix seconds
     pub warnings:     Vec<String>,  // verifier warnings stored for audit
+    /// Canonical inner-payload JSON string used when computing the ed25519 signature.
+    ///
+    /// Transmitted over the wire so community nodes can verify the signature
+    /// against the exact bytes that were signed, without re-serializing the
+    /// typed `payload` (which would produce alphabetically-sorted keys via
+    /// `serde_json::Value` and break the digest).
+    pub payload_json: String,
 }
 
 /// Canonical byte representation that is hashed and signed with ed25519.

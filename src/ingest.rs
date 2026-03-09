@@ -17,17 +17,21 @@ use crate::model::RouteType;
 /// any DB access occurs.  `feed_data` is `None` when the crawler could not parse
 /// the feed (e.g. HTTP error); the verifier chain still runs so the error can
 /// be recorded.
+#[expect(dead_code, reason = "source_url and http_status are wire-protocol fields, consumed by future crawl-log verifier")]
 #[derive(Debug, Deserialize)]
 pub struct IngestFeedRequest {
     pub canonical_url: String,
+    /// Original URL before any redirect following; used in crawl-log auditing.
     pub source_url:    String,
     pub crawl_token:   String,
+    /// HTTP status returned by the crawler; stored for dead-feed detection.
     pub http_status:   u16,
     pub content_hash:  String,
     pub feed_data:     Option<IngestFeedData>,
 }
 
 /// Parsed feed content supplied by the crawler when the fetch succeeded.
+#[expect(dead_code, reason = "pub_date is a wire-protocol field stored for future newest/oldest item tracking")]
 #[derive(Debug, Deserialize)]
 pub struct IngestFeedData {
     pub feed_guid:    String,
@@ -40,6 +44,7 @@ pub struct IngestFeedData {
     pub raw_medium:   Option<String>,
     pub author_name:  Option<String>,
     pub owner_name:   Option<String>,
+    /// Publication date of the feed channel; drives `newest_item_at` tracking.
     pub pub_date:     Option<i64>,
     pub tracks:       Vec<IngestTrackData>,
 }

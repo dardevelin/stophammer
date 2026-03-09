@@ -287,11 +287,9 @@ fn apply_single_event(db: &db::Db, node_pubkey: &str, ev: &event::Event) -> Resu
         &conn,
         &ev.event_id,
         &ev.event_type,
-        // Re-serialize the payload to get the canonical JSON string.
-        // This is fine: the signature was already verified against the same
-        // payload, so no integrity risk.
-        &serde_json::to_string(&ev.payload)
-            .map_err(db::DbError::Json)?,
+        // Use the canonical payload_json from the wire — the same bytes that
+        // were signed, so future re-verifications remain valid.
+        &ev.payload_json,
         &ev.subject_guid,
         &ev.signed_by,
         &ev.signature,

@@ -159,13 +159,22 @@ pub fn verify_event_signature(event: &Event) -> Result<(), SigningError> {
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "pubkey must be 32 bytes"))?;
     let verifying_key = VerifyingKey::from_bytes(&pubkey_arr)?;
 
-    let payload_json = serde_json::to_string(&event.payload)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    // Use the canonical payload_json string set at sign time.
+    // Re-serializing through EventPayload (an internally-tagged enum) would
+    // round-trip through serde_json::Value, which sorts object keys
+    // alphabetically — producing a different digest than the original struct
+    // serialisation that preserves declaration order.
+    if event.payload_json.is_empty() {
+        return Err(SigningError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "event.payload_json is empty — populate it before calling verify_event_signature",
+        )));
+    }
 
     let payload = EventSigningPayload {
         event_id:     &event.event_id,
         event_type:   &event.event_type,
-        payload_json: &payload_json,
+        payload_json: &event.payload_json,
         subject_guid: &event.subject_guid,
         created_at:   event.created_at,
     };
@@ -181,4 +190,45 @@ pub fn verify_event_signature(event: &Event) -> Result<(), SigningError> {
 
     verifying_key.verify(&digest, &sig)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event::{EventPayload, EventType, ArtistUpsertedPayload};
+    use crate::model::Artist;
+
+    #[test]
+    fn sign_verify_roundtrip() {
+        let signer = NodeSigner::load_or_create("/tmp/sign-roundtrip.key").unwrap();
+
+        let artist = Artist {
+            artist_id:  "artist-1".into(),
+            name:       "Test Artist".into(),
+            name_lower: "test artist".into(),
+            created_at: 1_000_000,
+        };
+
+        let inner = ArtistUpsertedPayload { artist };
+        let payload_json = serde_json::to_string(&inner).unwrap();
+
+        let (signed_by, signature) = signer.sign_event(
+            "evt-1", &EventType::ArtistUpserted, &payload_json, "subj-1", 9999,
+        );
+
+        let event = crate::event::Event {
+            event_id:     "evt-1".into(),
+            event_type:   EventType::ArtistUpserted,
+            payload:      EventPayload::ArtistUpserted(inner),
+            payload_json: payload_json.clone(),
+            subject_guid: "subj-1".into(),
+            signed_by,
+            signature,
+            seq:        1,
+            created_at: 9999,
+            warnings:   vec![],
+        };
+
+        verify_event_signature(&event).expect("signature verification failed");
+    }
 }

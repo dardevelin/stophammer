@@ -28,6 +28,10 @@ pub struct IngestContext<'a> {
     /// Read-only view of the database, used by verifiers that need prior state.
     pub db:       &'a Connection,
     /// The feed row already stored for this URL, if one exists.
+    ///
+    /// Available for verifiers that need to diff against prior state; not yet
+    /// consumed but retained so new verifiers can use it without API changes.
+    #[expect(dead_code, reason = "used by future diff-based verifiers without API changes")]
     pub existing: Option<&'a Feed>,
 }
 
@@ -217,13 +221,13 @@ impl Verifier for EnclosureTypeVerifier {
             return VerifyResult::Pass;
         };
         for track in &feed_data.tracks {
-            if let Some(mime) = &track.enclosure_type
-                && mime.starts_with("video/")
-            {
-                return VerifyResult::Warn(format!(
-                    "track '{}' has video enclosure type '{mime}'",
-                    track.track_guid
-                ));
+            if let Some(mime) = &track.enclosure_type {
+                if mime.starts_with("video/") {
+                    return VerifyResult::Warn(format!(
+                        "track '{}' has video enclosure type '{mime}'",
+                        track.track_guid
+                    ));
+                }
             }
         }
         VerifyResult::Pass

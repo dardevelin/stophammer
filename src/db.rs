@@ -600,13 +600,20 @@ pub fn get_events_since(
         let et_quoted = format!("\"{et_str}\"");
         let event_type: EventType = serde_json::from_str(&et_quoted)?;
 
-        let payload: EventPayload = serde_json::from_str(&payload_json)?;
+        // payload_json stores the inner payload struct (e.g. ArtistUpsertedPayload).
+        // EventPayload uses #[serde(tag="type", content="data")] so we must wrap it
+        // back into the tagged envelope before deserializing through the enum.
+        let tagged = format!(r#"{{"type":"{et_str}","data":{payload_json}}}"#);
+        let payload: EventPayload = serde_json::from_str(&tagged)?;
         let warnings: Vec<String> = serde_json::from_str(&warnings_json)?;
 
         events.push(Event {
             event_id,
             event_type,
             payload,
+            // payload_json carries the original inner-struct JSON so that
+            // verify_event_signature can hash the same bytes that were signed.
+            payload_json: payload_json.clone(),
             subject_guid,
             signed_by,
             signature,

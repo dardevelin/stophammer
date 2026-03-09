@@ -37,6 +37,9 @@ pub struct AppState {
     /// Signs event payloads with this node's ed25519 key.
     pub signer:          Arc<signing::NodeSigner>,
     /// Hex-encoded ed25519 public key identifying this node in the network.
+    ///
+    /// Used in node-info endpoints and log output; not yet consumed by handlers.
+    #[expect(dead_code, reason = "used in future node-info endpoint")]
     pub node_pubkey_hex: String,
     /// Token required in `X-Admin-Token` for admin endpoints. Empty string means
     /// the token was not configured and all admin calls return 403.
