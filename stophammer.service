@@ -1,0 +1,18 @@
+[Unit]
+Description=Stophammer V4V Music Feed Index Node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=stophammer
+EnvironmentFile=/etc/stophammer/env
+ExecStart=/usr/local/bin/stophammer
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/stophammer
+
+[Install]
+WantedBy=multi-user.target
