@@ -4,6 +4,7 @@
 //! Pagination uses opaque base64-encoded cursors. Nested data can be requested
 //! via the `?include=` query parameter.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{
@@ -84,6 +85,19 @@ impl ListQuery {
     }
 }
 
+#[derive(Debug, Deserialize)]
+pub struct SearchQuery {
+    #[allow(dead_code)]
+    q:       String,
+    #[serde(rename = "type")]
+    #[allow(dead_code)]
+    kind:    Option<String>,
+    #[allow(dead_code)]
+    limit:   Option<i64>,
+    #[allow(dead_code)]
+    cursor:  Option<String>,
+}
+
 // ── Serializable types ──────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize)]
@@ -157,6 +171,57 @@ struct RouteResponse {
     custom_value:   Option<String>,
     split:          i64,
     fee:            bool,
+}
+
+#[derive(Debug, Serialize)]
+struct TrackResponse {
+    track_guid:      String,
+    feed_guid:       String,
+    title:           String,
+    artist_credit:   CreditResponse,
+    pub_date:        Option<i64>,
+    duration_secs:   Option<i64>,
+    enclosure_url:   Option<String>,
+    enclosure_type:  Option<String>,
+    enclosure_bytes: Option<i64>,
+    track_number:    Option<i64>,
+    season:          Option<i64>,
+    explicit:        bool,
+    description:     Option<String>,
+    created_at:      i64,
+    updated_at:      i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    payment_routes:     Option<Vec<RouteResponse>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value_time_splits:  Option<Vec<VtsResponse>>,
+}
+
+#[derive(Debug, Serialize)]
+struct VtsResponse {
+    start_time_secs:   i64,
+    duration_secs:     Option<i64>,
+    remote_feed_guid:  String,
+    remote_item_guid:  String,
+    split:             i64,
+}
+
+/// Intermediate row type for track queries to avoid complex tuple types.
+struct TrackRow {
+    track_guid:       String,
+    feed_guid:        String,
+    credit_id:        i64,
+    title:            String,
+    pub_date:         Option<i64>,
+    duration_secs:    Option<i64>,
+    enclosure_url:    Option<String>,
+    enclosure_type:   Option<String>,
+    enclosure_bytes:  Option<i64>,
+    track_number:     Option<i64>,
+    season:           Option<i64>,
+    explicit_int:     i64,
+    description:      Option<String>,
+    created_at:       i64,
+    updated_at:       i64,
 }
 
 /// Intermediate row type for feed queries to avoid complex tuple types.
@@ -507,6 +572,295 @@ fn load_credit(conn: &rusqlite::Connection, credit_id: i64) -> Result<CreditResp
     Ok(CreditResponse { id, display_name, names })
 }
 
+// ── GET /v1/tracks/{guid} ────────────────────────────────────────────────────
+
+async fn handle_get_track(
+    State(state): State<Arc<api::AppState>>,
+    Path(track_guid): Path<String>,
+    Query(params): Query<ListQuery>,
+) -> Result<impl IntoResponse, api::ApiError> {
+    let state2 = Arc::clone(&state);
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = state2.db.lock().unwrap();
+
+        let row = conn.query_row(
+            "SELECT track_guid, feed_guid, artist_credit_id, title, pub_date, \
+             duration_secs, enclosure_url, enclosure_type, enclosure_bytes, \
+             track_number, season, explicit, description, created_at, updated_at \
+             FROM tracks WHERE track_guid = ?1",
+            params![track_guid],
+            |row| Ok(TrackRow {
+                track_guid:      row.get(0)?,
+                feed_guid:       row.get(1)?,
+                credit_id:       row.get(2)?,
+                title:           row.get(3)?,
+                pub_date:        row.get(4)?,
+                duration_secs:   row.get(5)?,
+                enclosure_url:   row.get(6)?,
+                enclosure_type:  row.get(7)?,
+                enclosure_bytes: row.get(8)?,
+                track_number:    row.get(9)?,
+                season:          row.get(10)?,
+                explicit_int:    row.get(11)?,
+                description:     row.get(12)?,
+                created_at:      row.get(13)?,
+                updated_at:      row.get(14)?,
+            }),
+        ).map_err(|_| api::ApiError {
+            status: StatusCode::NOT_FOUND,
+            message: "track not found".into(),
+        })?;
+
+        let credit = load_credit(&conn, row.credit_id)?;
+
+        let mut resp = TrackResponse {
+            track_guid:      row.track_guid,
+            feed_guid:       row.feed_guid,
+            title:           row.title,
+            artist_credit:   credit,
+            pub_date:        row.pub_date,
+            duration_secs:   row.duration_secs,
+            enclosure_url:   row.enclosure_url,
+            enclosure_type:  row.enclosure_type,
+            enclosure_bytes: row.enclosure_bytes,
+            track_number:    row.track_number,
+            season:          row.season,
+            explicit:        row.explicit_int != 0,
+            description:     row.description,
+            created_at:      row.created_at,
+            updated_at:      row.updated_at,
+            payment_routes:     None,
+            value_time_splits:  None,
+        };
+
+        if params.includes("payment_routes") {
+            let mut stmt = conn.prepare(
+                "SELECT recipient_name, route_type, address, custom_key, custom_value, split, fee \
+                 FROM payment_routes WHERE track_guid = ?1",
+            )?;
+            let routes: Vec<RouteResponse> = stmt.query_map(params![track_guid], |row| {
+                Ok(RouteResponse {
+                    recipient_name: row.get(0)?,
+                    route_type:     row.get(1)?,
+                    address:        row.get(2)?,
+                    custom_key:     row.get(3)?,
+                    custom_value:   row.get(4)?,
+                    split:          row.get(5)?,
+                    fee:            row.get::<_, i64>(6)? != 0,
+                })
+            })?.collect::<Result<_, _>>()?;
+            resp.payment_routes = Some(routes);
+        }
+
+        if params.includes("value_time_splits") {
+            let mut stmt = conn.prepare(
+                "SELECT start_time_secs, duration_secs, remote_feed_guid, remote_item_guid, split \
+                 FROM value_time_splits WHERE source_track_guid = ?1",
+            )?;
+            let vts: Vec<VtsResponse> = stmt.query_map(params![track_guid], |row| {
+                Ok(VtsResponse {
+                    start_time_secs:  row.get(0)?,
+                    duration_secs:    row.get(1)?,
+                    remote_feed_guid: row.get(2)?,
+                    remote_item_guid: row.get(3)?,
+                    split:            row.get(4)?,
+                })
+            })?.collect::<Result<_, _>>()?;
+            resp.value_time_splits = Some(vts);
+        }
+
+        Ok::<_, api::ApiError>(QueryResponse {
+            data:       resp,
+            pagination: Pagination { cursor: None, has_more: false },
+            meta:       meta(&state2),
+        })
+    })
+    .await
+    .map_err(|e| api::ApiError {
+        status:  StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("internal task panic: {e}"),
+    })??;
+
+    Ok(Json(result))
+}
+
+// ── GET /v1/recent ──────────────────────────────────────────────────────────
+
+#[expect(clippy::too_many_lines, reason = "single paginated-list flow with two SQL branches")]
+async fn handle_get_recent(
+    State(state): State<Arc<api::AppState>>,
+    Query(params): Query<ListQuery>,
+) -> Result<impl IntoResponse, api::ApiError> {
+    let state2 = Arc::clone(&state);
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = state2.db.lock().unwrap();
+        let limit = params.capped_limit();
+
+        let rows: Vec<FeedRow> = if let Some(ref cursor_str) = params.cursor {
+            let decoded = decode_cursor(cursor_str)?;
+            let parts: Vec<&str> = decoded.splitn(2, ':').collect();
+            if parts.len() != 2 {
+                return Err(api::ApiError {
+                    status:  StatusCode::BAD_REQUEST,
+                    message: "invalid cursor format".into(),
+                });
+            }
+            let cursor_ts: i64 = parts[0].parse().map_err(|_| api::ApiError {
+                status:  StatusCode::BAD_REQUEST,
+                message: "invalid cursor timestamp".into(),
+            })?;
+            let cursor_guid = parts[1];
+
+            let mut stmt = conn.prepare(
+                "SELECT feed_guid, feed_url, title, artist_credit_id, \
+                 description, image_url, language, explicit, \
+                 episode_count, newest_item_at, oldest_item_at, \
+                 created_at, updated_at \
+                 FROM feeds \
+                 WHERE (newest_item_at, feed_guid) < (?1, ?2) \
+                 ORDER BY newest_item_at DESC, feed_guid DESC \
+                 LIMIT ?3",
+            )?;
+            stmt.query_map(params![cursor_ts, cursor_guid, limit + 1], |row| {
+                Ok(FeedRow {
+                    feed_guid:      row.get(0)?,
+                    feed_url:       row.get(1)?,
+                    title:          row.get(2)?,
+                    credit_id:      row.get(3)?,
+                    description:    row.get(4)?,
+                    image_url:      row.get(5)?,
+                    language:       row.get(6)?,
+                    explicit_int:   row.get(7)?,
+                    episode_count:  row.get(8)?,
+                    newest_item_at: row.get(9)?,
+                    oldest_item_at: row.get(10)?,
+                    created_at:     row.get(11)?,
+                    updated_at:     row.get(12)?,
+                })
+            })?.collect::<Result<_, _>>()?
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT feed_guid, feed_url, title, artist_credit_id, \
+                 description, image_url, language, explicit, \
+                 episode_count, newest_item_at, oldest_item_at, \
+                 created_at, updated_at \
+                 FROM feeds \
+                 ORDER BY newest_item_at DESC, feed_guid DESC \
+                 LIMIT ?1",
+            )?;
+            stmt.query_map(params![limit + 1], |row| {
+                Ok(FeedRow {
+                    feed_guid:      row.get(0)?,
+                    feed_url:       row.get(1)?,
+                    title:          row.get(2)?,
+                    credit_id:      row.get(3)?,
+                    description:    row.get(4)?,
+                    image_url:      row.get(5)?,
+                    language:       row.get(6)?,
+                    explicit_int:   row.get(7)?,
+                    episode_count:  row.get(8)?,
+                    newest_item_at: row.get(9)?,
+                    oldest_item_at: row.get(10)?,
+                    created_at:     row.get(11)?,
+                    updated_at:     row.get(12)?,
+                })
+            })?.collect::<Result<_, _>>()?
+        };
+
+        let has_more = rows.len() > usize::try_from(limit).unwrap_or(usize::MAX);
+        let items: Vec<_> = rows.into_iter()
+            .take(usize::try_from(limit).unwrap_or(usize::MAX))
+            .collect();
+
+        let next_cursor = if has_more {
+            items.last().and_then(|r| {
+                r.newest_item_at.map(|ts| encode_cursor(&format!("{ts}:{}", r.feed_guid)))
+            })
+        } else {
+            None
+        };
+
+        let mut feeds = Vec::with_capacity(items.len());
+        for r in items {
+            let credit = load_credit(&conn, r.credit_id)?;
+            feeds.push(FeedResponse {
+                feed_guid:        r.feed_guid,
+                feed_url:         r.feed_url,
+                title:            r.title,
+                artist_credit:    credit,
+                description:      r.description,
+                image_url:        r.image_url,
+                language:         r.language,
+                explicit:         r.explicit_int != 0,
+                episode_count:    r.episode_count,
+                newest_item_at:   r.newest_item_at,
+                oldest_item_at:   r.oldest_item_at,
+                created_at:       r.created_at,
+                updated_at:       r.updated_at,
+                tracks:           None,
+                payment_routes:   None,
+            });
+        }
+
+        Ok::<_, api::ApiError>(QueryResponse {
+            data:       feeds,
+            pagination: Pagination { cursor: next_cursor, has_more },
+            meta:       meta(&state2),
+        })
+    })
+    .await
+    .map_err(|e| api::ApiError {
+        status:  StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("internal task panic: {e}"),
+    })??;
+
+    Ok(Json(result))
+}
+
+// ── GET /v1/search ──────────────────────────────────────────────────────────
+
+async fn handle_search(
+    State(state): State<Arc<api::AppState>>,
+    Query(_params): Query<SearchQuery>,
+) -> Result<impl IntoResponse, api::ApiError> {
+    // TODO: Wire up crate::search::search() once the search module is built.
+    // For now, return an empty result set.
+    let empty: Vec<serde_json::Value> = Vec::new();
+    Ok(Json(QueryResponse {
+        data:       empty,
+        pagination: Pagination { cursor: None, has_more: false },
+        meta:       meta(&state),
+    }))
+}
+
+// ── GET /v1/node/capabilities ───────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+struct CapabilitiesResponse {
+    api_version:    &'static str,
+    node_pubkey:    String,
+    capabilities:   Vec<&'static str>,
+    entity_types:   Vec<&'static str>,
+    include_params: HashMap<&'static str, Vec<&'static str>>,
+}
+
+async fn handle_capabilities(
+    State(state): State<Arc<api::AppState>>,
+) -> impl IntoResponse {
+    let mut include_params = HashMap::new();
+    include_params.insert("artist", vec!["aliases", "credits"]);
+    include_params.insert("feed",   vec!["tracks", "payment_routes"]);
+    include_params.insert("track",  vec!["payment_routes", "value_time_splits"]);
+
+    Json(CapabilitiesResponse {
+        api_version:  "v1",
+        node_pubkey:  state.node_pubkey_hex.clone(),
+        capabilities: vec!["query", "search", "sync", "push"],
+        entity_types: vec!["artist", "feed", "track"],
+        include_params,
+    })
+}
+
 // ── Router builder ──────────────────────────────────────────────────────────
 
 use axum::routing::get;
@@ -516,4 +870,8 @@ pub fn query_routes() -> axum::Router<Arc<api::AppState>> {
         .route("/v1/artists/{id}",       get(handle_get_artist))
         .route("/v1/artists/{id}/feeds", get(handle_get_artist_feeds))
         .route("/v1/feeds/{guid}",       get(handle_get_feed))
+        .route("/v1/tracks/{guid}",      get(handle_get_track))
+        .route("/v1/recent",             get(handle_get_recent))
+        .route("/v1/search",             get(handle_search))
+        .route("/v1/node/capabilities",  get(handle_capabilities))
 }
