@@ -84,6 +84,28 @@ pub struct EventRow {
     pub warnings:     Vec<String>,
 }
 
+// ── ExternalIdRow ──────────────────────────────────────────────────────────────
+
+/// A row from the `external_ids` table linking an entity to an external system.
+#[allow(dead_code)]
+pub struct ExternalIdRow {
+    pub id:     i64,
+    pub scheme: String,
+    pub value:  String,
+}
+
+// ── EntitySourceRow ────────────────────────────────────────────────────────────
+
+/// A row from the `entity_source` table recording where an entity came from.
+#[allow(dead_code)]
+pub struct EntitySourceRow {
+    pub id:          i64,
+    pub source_type: String,
+    pub source_url:  Option<String>,
+    pub trust_level: i64,
+    pub created_at:  i64,
+}
+
 // ── Schema constant ──────────────────────────────────────────────────────────
 
 const SCHEMA: &str = include_str!("schema.sql");
@@ -981,6 +1003,234 @@ pub fn get_node_sync_cursor(conn: &Connection, node_pubkey: &str) -> Result<i64,
     Ok(seq.unwrap_or(0))
 }
 
+// ── Tags ─────────────────────────────────────────────────────────────────────
+
+/// Returns the id of an existing tag with the given (lowercased) name, or
+/// creates a new one and returns its id.
+#[expect(dead_code, reason = "will be called from ingest/admin handlers")]
+pub fn get_or_create_tag(conn: &Connection, name: &str) -> Result<i64, DbError> {
+    let lower = name.to_lowercase();
+    let now = unix_now();
+
+    conn.execute(
+        "INSERT OR IGNORE INTO tags (name, created_at) VALUES (?1, ?2)",
+        params![lower, now],
+    )?;
+
+    let id: i64 = conn.query_row(
+        "SELECT id FROM tags WHERE name = ?1",
+        params![lower],
+        |row| row.get(0),
+    )?;
+
+    Ok(id)
+}
+
+/// Inserts a tag association into the appropriate junction table based on
+/// `entity_type` ("artist", "feed", or "track").
+#[expect(dead_code, reason = "will be called from ingest/admin handlers")]
+pub fn apply_tag(conn: &Connection, entity_type: &str, entity_id: &str, tag_id: i64) -> Result<(), DbError> {
+    let now = unix_now();
+    match entity_type {
+        "artist" => {
+            conn.execute(
+                "INSERT OR IGNORE INTO artist_tag (artist_id, tag_id, created_at) VALUES (?1, ?2, ?3)",
+                params![entity_id, tag_id, now],
+            )?;
+        }
+        "feed" => {
+            conn.execute(
+                "INSERT OR IGNORE INTO feed_tag (feed_guid, tag_id, created_at) VALUES (?1, ?2, ?3)",
+                params![entity_id, tag_id, now],
+            )?;
+        }
+        "track" => {
+            conn.execute(
+                "INSERT OR IGNORE INTO track_tag (track_guid, tag_id, created_at) VALUES (?1, ?2, ?3)",
+                params![entity_id, tag_id, now],
+            )?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Removes a tag association from the appropriate junction table.
+#[expect(dead_code, reason = "will be called from admin handlers")]
+pub fn remove_tag(conn: &Connection, entity_type: &str, entity_id: &str, tag_id: i64) -> Result<(), DbError> {
+    match entity_type {
+        "artist" => {
+            conn.execute(
+                "DELETE FROM artist_tag WHERE artist_id = ?1 AND tag_id = ?2",
+                params![entity_id, tag_id],
+            )?;
+        }
+        "feed" => {
+            conn.execute(
+                "DELETE FROM feed_tag WHERE feed_guid = ?1 AND tag_id = ?2",
+                params![entity_id, tag_id],
+            )?;
+        }
+        "track" => {
+            conn.execute(
+                "DELETE FROM track_tag WHERE track_guid = ?1 AND tag_id = ?2",
+                params![entity_id, tag_id],
+            )?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Returns `(tag_id, name)` pairs for all tags associated with an entity.
+#[expect(dead_code, reason = "will be called from admin/query handlers")]
+pub fn get_tags_for_entity(conn: &Connection, entity_type: &str, entity_id: &str) -> Result<Vec<(i64, String)>, DbError> {
+    let result = match entity_type {
+        "artist" => {
+            let mut stmt = conn.prepare(
+                "SELECT t.id, t.name FROM tags t \
+                 JOIN artist_tag at ON at.tag_id = t.id \
+                 WHERE at.artist_id = ?1 ORDER BY t.name"
+            )?;
+            stmt.query_map(params![entity_id], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?.collect::<Result<Vec<_>, _>>()?
+        }
+        "feed" => {
+            let mut stmt = conn.prepare(
+                "SELECT t.id, t.name FROM tags t \
+                 JOIN feed_tag ft ON ft.tag_id = t.id \
+                 WHERE ft.feed_guid = ?1 ORDER BY t.name"
+            )?;
+            stmt.query_map(params![entity_id], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?.collect::<Result<Vec<_>, _>>()?
+        }
+        "track" => {
+            let mut stmt = conn.prepare(
+                "SELECT t.id, t.name FROM tags t \
+                 JOIN track_tag tt ON tt.tag_id = t.id \
+                 WHERE tt.track_guid = ?1 ORDER BY t.name"
+            )?;
+            stmt.query_map(params![entity_id], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?.collect::<Result<Vec<_>, _>>()?
+        }
+        _ => Vec::new(),
+    };
+    Ok(result)
+}
+
+// ── Relationships ────────────────────────────────────────────────────────────
+
+/// Row returned by [`get_artist_rels`].
+pub struct ArtistRelRow {
+    #[allow(dead_code)]
+    pub id:            i64,
+    pub artist_id_a:   String,
+    pub artist_id_b:   String,
+    pub rel_type_name: String,
+    pub begin_year:    Option<i64>,
+    pub end_year:      Option<i64>,
+}
+
+/// Checks whether a `rel_type_id` exists in the `rel_type` lookup table.
+pub fn validate_rel_type(conn: &Connection, rel_type_id: i64) -> Result<bool, DbError> {
+    let exists: Option<i64> = conn.query_row(
+        "SELECT id FROM rel_type WHERE id = ?1",
+        params![rel_type_id],
+        |row| row.get(0),
+    ).optional()?;
+    Ok(exists.is_some())
+}
+
+/// Creates an artist-to-artist relationship. Returns the new row id.
+///
+/// Validates `rel_type_id` before inserting.
+#[expect(dead_code, reason = "will be called from admin/ingest handlers")]
+pub fn create_artist_artist_rel(
+    conn:        &Connection,
+    artist_id_a: &str,
+    artist_id_b: &str,
+    rel_type_id: i64,
+    begin_year:  Option<i64>,
+    end_year:    Option<i64>,
+) -> Result<i64, DbError> {
+    // Validate rel_type_id exists.
+    let valid = validate_rel_type(conn, rel_type_id)?;
+    if !valid {
+        return Err(DbError::Rusqlite(rusqlite::Error::QueryReturnedNoRows));
+    }
+
+    let now = unix_now();
+    conn.execute(
+        "INSERT INTO artist_artist_rel (artist_id_a, artist_id_b, rel_type_id, begin_year, end_year, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![artist_id_a, artist_id_b, rel_type_id, begin_year, end_year, now],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Returns all artist-artist relationships where `artist_id` appears on
+/// either side (as `artist_id_a` or `artist_id_b`), joined with the
+/// `rel_type` name.
+pub fn get_artist_rels(conn: &Connection, artist_id: &str) -> Result<Vec<ArtistRelRow>, DbError> {
+    let mut stmt = conn.prepare(
+        "SELECT aar.id, aar.artist_id_a, aar.artist_id_b, rt.name, aar.begin_year, aar.end_year \
+         FROM artist_artist_rel aar \
+         JOIN rel_type rt ON rt.id = aar.rel_type_id \
+         WHERE aar.artist_id_a = ?1 OR aar.artist_id_b = ?1 \
+         ORDER BY aar.id",
+    )?;
+
+    let rows: Vec<ArtistRelRow> = stmt.query_map(params![artist_id], |row| {
+        Ok(ArtistRelRow {
+            id:            row.get(0)?,
+            artist_id_a:   row.get(1)?,
+            artist_id_b:   row.get(2)?,
+            rel_type_name: row.get(3)?,
+            begin_year:    row.get(4)?,
+            end_year:      row.get(5)?,
+        })
+    })?.collect::<Result<_, _>>()?;
+
+    Ok(rows)
+}
+
+/// Creates a track-to-track relationship. Returns the new row id.
+#[expect(dead_code, reason = "will be called from admin/ingest handlers")]
+pub fn create_track_rel(
+    conn:         &Connection,
+    track_guid_a: &str,
+    track_guid_b: &str,
+    rel_type_id:  i64,
+) -> Result<i64, DbError> {
+    let now = unix_now();
+    conn.execute(
+        "INSERT INTO track_rel (track_guid_a, track_guid_b, rel_type_id, created_at) \
+         VALUES (?1, ?2, ?3, ?4)",
+        params![track_guid_a, track_guid_b, rel_type_id, now],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Creates a feed-to-feed relationship. Returns the new row id.
+#[expect(dead_code, reason = "will be called from admin/ingest handlers")]
+pub fn create_feed_rel(
+    conn:        &Connection,
+    feed_guid_a: &str,
+    feed_guid_b: &str,
+    rel_type_id: i64,
+) -> Result<i64, DbError> {
+    let now = unix_now();
+    conn.execute(
+        "INSERT INTO feed_rel (feed_guid_a, feed_guid_b, rel_type_id, created_at) \
+         VALUES (?1, ?2, ?3, ?4)",
+        params![feed_guid_a, feed_guid_b, rel_type_id, now],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
 // ── get_existing_feed ─────────────────────────────────────────────────────────
 
 /// Looks up the feed row whose `feed_url` matches, returning `None` if absent.
@@ -1277,4 +1527,124 @@ pub fn ingest_transaction(
     tx.commit()?;
 
     Ok(seqs)
+}
+
+// ── External ID operations ──────────────────────────────────────────────────
+
+/// Links an external identifier (e.g. `MusicBrainz`, ISRC, Spotify) to an entity.
+///
+/// Uses `INSERT OR REPLACE` so a second call with the same `(entity_type,
+/// entity_id, scheme)` triple updates the stored `value`.
+#[expect(dead_code, reason = "will be called from importer and enrichment pipelines")]
+pub fn link_external_id(
+    conn:        &Connection,
+    entity_type: &str,
+    entity_id:   &str,
+    scheme:      &str,
+    value:       &str,
+) -> Result<i64, DbError> {
+    let now = unix_now();
+    conn.execute(
+        "INSERT OR REPLACE INTO external_ids (entity_type, entity_id, scheme, value, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![entity_type, entity_id, scheme, value, now],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Returns all external IDs linked to the given entity.
+#[expect(dead_code, reason = "will be called from query API enrichment")]
+pub fn get_external_ids(
+    conn:        &Connection,
+    entity_type: &str,
+    entity_id:   &str,
+) -> Result<Vec<ExternalIdRow>, DbError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, scheme, value FROM external_ids \
+         WHERE entity_type = ?1 AND entity_id = ?2 \
+         ORDER BY scheme",
+    )?;
+    let rows = stmt.query_map(params![entity_type, entity_id], |row| {
+        Ok(ExternalIdRow {
+            id:     row.get(0)?,
+            scheme: row.get(1)?,
+            value:  row.get(2)?,
+        })
+    })?;
+    let mut result = Vec::new();
+    for row in rows {
+        result.push(row?);
+    }
+    Ok(result)
+}
+
+/// Given a `(scheme, value)` pair, returns the `(entity_type, entity_id)` that
+/// owns it, or `None` if no matching row exists.
+#[expect(dead_code, reason = "will be called from reverse-lookup API endpoint")]
+pub fn reverse_lookup_external_id(
+    conn:   &Connection,
+    scheme: &str,
+    value:  &str,
+) -> Result<Option<(String, String)>, DbError> {
+    let result = conn.query_row(
+        "SELECT entity_type, entity_id FROM external_ids \
+         WHERE scheme = ?1 AND value = ?2",
+        params![scheme, value],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).optional()?;
+    Ok(result)
+}
+
+// ── Provenance operations ───────────────────────────────────────────────────
+
+/// Records how an entity was discovered or imported.
+///
+/// `source_type` should be one of: `"rss_crawl"`, `"manifest"`, `"manual"`,
+/// `"bulk_import"`. `trust_level`: 0 = unknown, 1 = rss, 2 = signed manifest,
+/// 3 = verified.
+#[expect(dead_code, reason = "will be called from crawl and import pipelines")]
+pub fn record_entity_source(
+    conn:        &Connection,
+    entity_type: &str,
+    entity_id:   &str,
+    source_type: &str,
+    source_url:  Option<&str>,
+    trust_level: i64,
+) -> Result<i64, DbError> {
+    let now = unix_now();
+    conn.execute(
+        "INSERT INTO entity_source (entity_type, entity_id, source_type, source_url, trust_level, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![entity_type, entity_id, source_type, source_url, trust_level, now],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Returns all provenance records for the given entity.
+#[expect(dead_code, reason = "will be called from query API enrichment")]
+pub fn get_entity_sources(
+    conn:        &Connection,
+    entity_type: &str,
+    entity_id:   &str,
+) -> Result<Vec<EntitySourceRow>, DbError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, source_type, source_url, trust_level, created_at \
+         FROM entity_source \
+         WHERE entity_type = ?1 AND entity_id = ?2 \
+         ORDER BY created_at",
+    )?;
+    let rows = stmt.query_map(params![entity_type, entity_id], |row| {
+        Ok(EntitySourceRow {
+            id:          row.get(0)?,
+            source_type: row.get(1)?,
+            source_url:  row.get(2)?,
+            trust_level: row.get(3)?,
+            created_at:  row.get(4)?,
+        })
+    })?;
+    let mut result = Vec::new();
+    for row in rows {
+        result.push(row?);
+    }
+    Ok(result)
 }

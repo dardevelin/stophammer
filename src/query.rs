@@ -116,6 +116,19 @@ struct ArtistResponse {
     aliases:    Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     credits:    Option<Vec<CreditResponse>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tags:           Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    relationships:  Option<Vec<RelResponse>>,
+}
+
+#[derive(Debug, Serialize)]
+struct RelResponse {
+    artist_id_a: String,
+    artist_id_b: String,
+    role:        String,
+    begin_year:  Option<i64>,
+    end_year:    Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -152,6 +165,8 @@ struct FeedResponse {
     tracks:           Option<Vec<TrackSummary>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     payment_routes:   Option<Vec<RouteResponse>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tags:             Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -194,6 +209,8 @@ struct TrackResponse {
     payment_routes:     Option<Vec<RouteResponse>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     value_time_splits:  Option<Vec<VtsResponse>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tags:               Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -203,6 +220,13 @@ struct VtsResponse {
     remote_feed_guid:  String,
     remote_item_guid:  String,
     split:             i64,
+}
+
+#[derive(Debug, Serialize)]
+struct PeerResponse {
+    node_pubkey:  String,
+    node_url:     String,
+    last_push_at: Option<i64>,
 }
 
 /// Intermediate row type for track queries to avoid complex tuple types.
@@ -274,8 +298,10 @@ async fn handle_get_artist(
                 end_year:   row.get(7)?,
                 created_at: row.get(8)?,
                 updated_at: row.get(9)?,
-                aliases:    None,
-                credits:    None,
+                aliases:        None,
+                credits:        None,
+                tags:           None,
+                relationships:  None,
             }),
         ).map_err(|_| api::ApiError {
             status: StatusCode::NOT_FOUND,
@@ -304,6 +330,21 @@ async fn handle_get_artist(
                     name:        n.name,
                     join_phrase: n.join_phrase,
                 }).collect(),
+            }).collect());
+        }
+
+        if params.includes("tags") {
+            artist.tags = Some(load_tags(&conn, "artist", &resolved_id)?);
+        }
+
+        if params.includes("relationships") {
+            let rels = db::get_artist_rels(&conn, &resolved_id)?;
+            artist.relationships = Some(rels.into_iter().map(|r| RelResponse {
+                artist_id_a: r.artist_id_a,
+                artist_id_b: r.artist_id_b,
+                role:        r.rel_type_name,
+                begin_year:  r.begin_year,
+                end_year:    r.end_year,
             }).collect());
         }
 
@@ -417,6 +458,7 @@ async fn handle_get_artist_feeds(
                 updated_at:       r.updated_at,
                 tracks:           None,
                 payment_routes:   None,
+                tags:             None,
             });
         }
 
@@ -490,6 +532,7 @@ async fn handle_get_feed(
             updated_at:     feed.12,
             tracks:         None,
             payment_routes: None,
+            tags:           None,
         };
 
         if params.includes("tracks") {
@@ -525,6 +568,10 @@ async fn handle_get_feed(
                 })
             })?.collect::<Result<_, _>>()?;
             resp.payment_routes = Some(routes);
+        }
+
+        if params.includes("tags") {
+            resp.tags = Some(load_tags(&conn, "feed", &feed_guid)?);
         }
 
         Ok::<_, api::ApiError>(QueryResponse {
@@ -572,8 +619,22 @@ fn load_credit(conn: &rusqlite::Connection, credit_id: i64) -> Result<CreditResp
     Ok(CreditResponse { id, display_name, names })
 }
 
+fn load_tags(conn: &rusqlite::Connection, entity_type: &str, entity_id: &str) -> Result<Vec<String>, api::ApiError> {
+    let sql = match entity_type {
+        "artist" => "SELECT t.name FROM tags t JOIN artist_tag at ON at.tag_id = t.id WHERE at.artist_id = ?1 ORDER BY t.name",
+        "feed"   => "SELECT t.name FROM tags t JOIN feed_tag ft ON ft.tag_id = t.id WHERE ft.feed_guid = ?1 ORDER BY t.name",
+        "track"  => "SELECT t.name FROM tags t JOIN track_tag tt ON tt.tag_id = t.id WHERE tt.track_guid = ?1 ORDER BY t.name",
+        _ => return Ok(Vec::new()),
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let tags: Vec<String> = stmt.query_map(params![entity_id], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    Ok(tags)
+}
+
 // ── GET /v1/tracks/{guid} ────────────────────────────────────────────────────
 
+#[expect(clippy::too_many_lines, reason = "single paginated-detail flow with optional includes")]
 async fn handle_get_track(
     State(state): State<Arc<api::AppState>>,
     Path(track_guid): Path<String>,
@@ -631,6 +692,7 @@ async fn handle_get_track(
             updated_at:      row.updated_at,
             payment_routes:     None,
             value_time_splits:  None,
+            tags:               None,
         };
 
         if params.includes("payment_routes") {
@@ -667,6 +729,10 @@ async fn handle_get_track(
                 })
             })?.collect::<Result<_, _>>()?;
             resp.value_time_splits = Some(vts);
+        }
+
+        if params.includes("tags") {
+            resp.tags = Some(load_tags(&conn, "track", &track_guid)?);
         }
 
         Ok::<_, api::ApiError>(QueryResponse {
@@ -799,6 +865,7 @@ async fn handle_get_recent(
                 updated_at:       r.updated_at,
                 tracks:           None,
                 payment_routes:   None,
+                tags:             None,
             });
         }
 
@@ -848,9 +915,9 @@ async fn handle_capabilities(
     State(state): State<Arc<api::AppState>>,
 ) -> impl IntoResponse {
     let mut include_params = HashMap::new();
-    include_params.insert("artist", vec!["aliases", "credits"]);
-    include_params.insert("feed",   vec!["tracks", "payment_routes"]);
-    include_params.insert("track",  vec!["payment_routes", "value_time_splits"]);
+    include_params.insert("artist", vec!["aliases", "credits", "tags", "relationships"]);
+    include_params.insert("feed",   vec!["tracks", "payment_routes", "tags"]);
+    include_params.insert("track",  vec!["payment_routes", "value_time_splits", "tags"]);
 
     Json(CapabilitiesResponse {
         api_version:  "v1",
@@ -859,6 +926,34 @@ async fn handle_capabilities(
         entity_types: vec!["artist", "feed", "track"],
         include_params,
     })
+}
+
+// ── GET /v1/peers ───────────────────────────────────────────────────────────
+
+async fn handle_get_peers(
+    State(state): State<Arc<api::AppState>>,
+) -> Result<impl IntoResponse, api::ApiError> {
+    let state2 = Arc::clone(&state);
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = state2.db.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT node_pubkey, node_url, last_push_at FROM peer_nodes ORDER BY node_pubkey",
+        )?;
+        let peers: Vec<PeerResponse> = stmt.query_map([], |row| {
+            Ok(PeerResponse {
+                node_pubkey:  row.get(0)?,
+                node_url:     row.get(1)?,
+                last_push_at: row.get(2)?,
+            })
+        })?.collect::<Result<_, _>>()?;
+        Ok::<_, api::ApiError>(peers)
+    })
+    .await
+    .map_err(|e| api::ApiError {
+        status:  StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("internal task panic: {e}"),
+    })??;
+    Ok(Json(result))
 }
 
 // ── Router builder ──────────────────────────────────────────────────────────
@@ -874,4 +969,5 @@ pub fn query_routes() -> axum::Router<Arc<api::AppState>> {
         .route("/v1/recent",             get(handle_get_recent))
         .route("/v1/search",             get(handle_search))
         .route("/v1/node/capabilities",  get(handle_capabilities))
+        .route("/v1/peers",              get(handle_get_peers))
 }
