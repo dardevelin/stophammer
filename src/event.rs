@@ -1,5 +1,3 @@
-// Rust guideline compliant (M-APP-ERROR, M-MODULE-DOCS) — 2026-03-09
-
 //! Event types and signing payload for the stophammer sync protocol.
 //!
 //! [`Event`] is the immutable sync primitive replicated between all nodes.
@@ -11,7 +9,7 @@
 //! delivery-ordering field and does not affect content integrity.
 
 use serde::{Deserialize, Serialize};
-use crate::model::{Artist, Feed, PaymentRoute, Track, ValueTimeSplit};
+use crate::model::{Artist, ArtistCredit, Feed, FeedPaymentRoute, PaymentRoute, Track, ValueTimeSplit};
 
 /// Discriminant identifying which domain action produced an [`Event`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -31,6 +29,10 @@ pub enum EventType {
     RoutesReplaced,
     /// Two artist records were merged; one was absorbed into the other.
     ArtistMerged,
+    /// An artist credit was created (multi-artist attribution).
+    ArtistCreditCreated,
+    /// Feed-level payment routes were replaced.
+    FeedRoutesReplaced,
 }
 
 /// Typed payload carried inside an [`Event`]; variant mirrors [`EventType`].
@@ -51,6 +53,10 @@ pub enum EventPayload {
     RoutesReplaced(RoutesReplacedPayload),
     /// Payload for an artist merge event.
     ArtistMerged(ArtistMergedPayload),
+    /// Payload for an artist credit creation event.
+    ArtistCreditCreated(ArtistCreditCreatedPayload),
+    /// Payload for a feed-level payment route replacement event.
+    FeedRoutesReplaced(FeedRoutesReplacedPayload),
 }
 
 /// The full signed event — the sync primitive between all nodes.
@@ -110,8 +116,9 @@ pub struct EventSigningPayload<'a> {
 /// Emitted when a feed is created or any of its metadata fields change.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeedUpsertedPayload {
-    pub feed:   Feed,
-    pub artist: Artist,
+    pub feed:          Feed,
+    pub artist:        Artist,
+    pub artist_credit: ArtistCredit,
 }
 
 /// Emitted when a feed is permanently removed from the index.
@@ -127,6 +134,7 @@ pub struct TrackUpsertedPayload {
     pub track:             Track,
     pub routes:            Vec<PaymentRoute>,
     pub value_time_splits: Vec<ValueTimeSplit>,
+    pub artist_credit:     ArtistCredit,
 }
 
 /// Emitted when a track is deleted from its parent feed.
@@ -159,4 +167,17 @@ pub struct ArtistMergedPayload {
     pub target_artist_id: String,
     /// Alias strings (lowercased) transferred from the source to the target.
     pub aliases_transferred: Vec<String>,
+}
+
+/// Emitted when a new artist credit is created (multi-artist attribution).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtistCreditCreatedPayload {
+    pub artist_credit: ArtistCredit,
+}
+
+/// Emitted when feed-level payment routes are atomically replaced.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeedRoutesReplacedPayload {
+    pub feed_guid: String,
+    pub routes:    Vec<FeedPaymentRoute>,
 }

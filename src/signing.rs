@@ -206,7 +206,15 @@ mod tests {
             artist_id:  "artist-1".into(),
             name:       "Test Artist".into(),
             name_lower: "test artist".into(),
+            sort_name:  None,
+            type_id:    None,
+            area:       None,
+            img_url:    None,
+            url:        None,
+            begin_year: None,
+            end_year:   None,
             created_at: 1_000_000,
+            updated_at: 1_000_000,
         };
 
         let inner = ArtistUpsertedPayload { artist };

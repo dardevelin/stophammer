@@ -1,5 +1,3 @@
-// Rust guideline compliant (M-APP-ERROR, M-MODULE-DOCS) — 2026-03-09
-
 //! Database access layer for stophammer.
 //!
 //! All SQL operations are collected here: schema initialisation, per-entity
@@ -13,7 +11,7 @@
 use std::fmt;
 use std::sync::{Arc, Mutex};
 use rusqlite::{Connection, OptionalExtension, params};
-use crate::model::{Artist, Feed, PaymentRoute, Track, ValueTimeSplit};
+use crate::model::{Artist, ArtistCredit, ArtistCreditName, Feed, FeedPaymentRoute, PaymentRoute, Track, ValueTimeSplit};
 use crate::event::{Event, EventPayload, EventType};
 
 pub type Db = Arc<Mutex<Connection>>;
@@ -106,15 +104,19 @@ pub fn open_db(path: &str) -> Connection {
 
 // ── Helper: serialize EventType to snake_case string (no quotes) ─────────────
 
-// WHY serde_json: EventType uses #[serde(rename_all = "snake_case")], so
-// serde_json::to_string is the canonical way to obtain the correct snake_case
-// string (e.g. "feed_upserted") without duplicating the rename logic here.
-// It produces a quoted JSON string like "\"feed_upserted\"" — we strip the
-// surrounding quotes to store the bare value in the events table.
 fn event_type_str(et: &EventType) -> Result<String, DbError> {
     let s = serde_json::to_string(et)?;
-    // serde_json produces "\"feed_upserted\"" — strip the surrounding quotes
     Ok(s.trim_matches('"').to_string())
+}
+
+// ── Helper: current unix timestamp ──────────────────────────────────────────
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .cast_signed()
 }
 
 // ── resolve_artist ────────────────────────────────────────────────────────────
@@ -127,16 +129,14 @@ fn event_type_str(et: &EventType) -> Result<String, DbError> {
 /// 2. `artists.name_lower = name.to_lowercase()` — direct name lookup (legacy
 ///    rows created before the alias table existed).
 /// 3. Insert new artist + insert a canonical alias row.
-///
-/// # Errors
-///
-/// Returns [`DbError::Rusqlite`] if any SQL operation fails.
 pub fn resolve_artist(conn: &Connection, name: &str) -> Result<Artist, DbError> {
     let name_lower = name.to_lowercase();
+    let now = unix_now();
 
     // 1. Check alias table first.
     let via_alias: Option<Artist> = conn.query_row(
-        "SELECT a.artist_id, a.name, a.name_lower, a.created_at \
+        "SELECT a.artist_id, a.name, a.name_lower, a.sort_name, a.type_id, a.area, \
+         a.img_url, a.url, a.begin_year, a.end_year, a.created_at, a.updated_at \
          FROM artist_aliases aa \
          JOIN artists a ON a.artist_id = aa.artist_id \
          WHERE aa.alias_lower = ?1 \
@@ -147,7 +147,15 @@ pub fn resolve_artist(conn: &Connection, name: &str) -> Result<Artist, DbError> 
                 artist_id:  row.get(0)?,
                 name:       row.get(1)?,
                 name_lower: row.get(2)?,
-                created_at: row.get(3)?,
+                sort_name:  row.get(3)?,
+                type_id:    row.get(4)?,
+                area:       row.get(5)?,
+                img_url:    row.get(6)?,
+                url:        row.get(7)?,
+                begin_year: row.get(8)?,
+                end_year:   row.get(9)?,
+                created_at: row.get(10)?,
+                updated_at: row.get(11)?,
             })
         },
     ).optional()?;
@@ -156,23 +164,31 @@ pub fn resolve_artist(conn: &Connection, name: &str) -> Result<Artist, DbError> 
         return Ok(a);
     }
 
-    // 2. Fall back to direct name_lower match (handles rows predating the alias table).
+    // 2. Fall back to direct name_lower match.
     let existing: Option<Artist> = conn.query_row(
-        "SELECT artist_id, name, name_lower, created_at FROM artists WHERE name_lower = ?1",
+        "SELECT artist_id, name, name_lower, sort_name, type_id, area, \
+         img_url, url, begin_year, end_year, created_at, updated_at \
+         FROM artists WHERE name_lower = ?1",
         params![name_lower],
         |row| {
             Ok(Artist {
                 artist_id:  row.get(0)?,
                 name:       row.get(1)?,
                 name_lower: row.get(2)?,
-                created_at: row.get(3)?,
+                sort_name:  row.get(3)?,
+                type_id:    row.get(4)?,
+                area:       row.get(5)?,
+                img_url:    row.get(6)?,
+                url:        row.get(7)?,
+                begin_year: row.get(8)?,
+                end_year:   row.get(9)?,
+                created_at: row.get(10)?,
+                updated_at: row.get(11)?,
             })
         },
     ).optional()?;
 
     if let Some(a) = existing {
-        // Back-fill the alias row for this legacy artist so future lookups hit
-        // the alias table instead of the slow name_lower scan.
         conn.execute(
             "INSERT OR IGNORE INTO artist_aliases (alias_lower, artist_id, created_at) \
              VALUES (?1, ?2, ?3)",
@@ -182,16 +198,11 @@ pub fn resolve_artist(conn: &Connection, name: &str) -> Result<Artist, DbError> 
     }
 
     // 3. New artist — insert artist row and its canonical alias.
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .cast_signed();
     let artist_id = uuid::Uuid::new_v4().to_string();
 
     conn.execute(
-        "INSERT INTO artists (artist_id, name, name_lower, created_at) VALUES (?1, ?2, ?3, ?4)",
-        params![artist_id, name, name_lower, now],
+        "INSERT INTO artists (artist_id, name, name_lower, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![artist_id, name, name_lower, now, now],
     )?;
 
     conn.execute(
@@ -199,27 +210,27 @@ pub fn resolve_artist(conn: &Connection, name: &str) -> Result<Artist, DbError> 
         params![name_lower, artist_id, now],
     )?;
 
-    Ok(Artist { artist_id, name: name.to_string(), name_lower, created_at: now })
+    Ok(Artist {
+        artist_id,
+        name: name.to_string(),
+        name_lower,
+        sort_name:  None,
+        type_id:    None,
+        area:       None,
+        img_url:    None,
+        url:        None,
+        begin_year: None,
+        end_year:   None,
+        created_at: now,
+        updated_at: now,
+    })
 }
 
 // ── add_artist_alias ──────────────────────────────────────────────────────────
 
 /// Registers `alias` (lowercased) as an additional lookup key for `artist_id`.
-///
-/// Uses `INSERT OR IGNORE` — if the `(alias_lower, artist_id)` pair already
-/// exists the call is a no-op.
-///
-/// # Errors
-///
-/// Returns [`DbError::Rusqlite`] if the SQL operation fails (e.g. `artist_id`
-/// does not exist and the foreign-key constraint fires).
 pub fn add_artist_alias(conn: &Connection, artist_id: &str, alias: &str) -> Result<(), DbError> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .cast_signed();
-
+    let now = unix_now();
     conn.execute(
         "INSERT OR IGNORE INTO artist_aliases (alias_lower, artist_id, created_at) \
          VALUES (?1, ?2, ?3)",
@@ -232,19 +243,10 @@ pub fn add_artist_alias(conn: &Connection, artist_id: &str, alias: &str) -> Resu
 
 /// Merges `source_artist_id` into `target_artist_id`.
 ///
-/// All feeds and tracks pointing to `source` are repointed to `target`. All
-/// aliases of `source` that do not already exist on `target` are transferred;
+/// All `artist_credit_name` entries pointing to `source` are repointed to `target`.
+/// All aliases of `source` that do not already exist on `target` are transferred;
 /// any that would conflict are dropped. The `source` artist row is then
 /// deleted. Returns the list of alias strings that were transferred.
-///
-/// This operation is intentionally admin-only and not automatic: determining
-/// whether two artists with the same name are truly the same entity requires
-/// human judgment (see ADR 0014).
-///
-/// # Errors
-///
-/// Returns [`DbError::Rusqlite`] if any SQL operation fails. The transaction is
-/// rolled back automatically on error.
 pub fn merge_artists(
     conn: &mut Connection,
     source_artist_id: &str,
@@ -252,8 +254,7 @@ pub fn merge_artists(
 ) -> Result<Vec<String>, DbError> {
     let tx = conn.transaction()?;
 
-    // Collect the aliases that will be transferred (those that do not already
-    // exist on target) before we mutate the table.
+    // Collect the aliases that will be transferred.
     let mut stmt = tx.prepare(
         "SELECT alias_lower FROM artist_aliases \
          WHERE artist_id = ?1 \
@@ -268,13 +269,9 @@ pub fn merge_artists(
         .collect::<Result<_, _>>()?;
     drop(stmt);
 
-    // Repoint feeds and tracks.
+    // Repoint artist_credit_name entries.
     tx.execute(
-        "UPDATE feeds SET artist_id = ?1 WHERE artist_id = ?2",
-        params![target_artist_id, source_artist_id],
-    )?;
-    tx.execute(
-        "UPDATE tracks SET artist_id = ?1 WHERE artist_id = ?2",
+        "UPDATE artist_credit_name SET artist_id = ?1 WHERE artist_id = ?2",
         params![target_artist_id, source_artist_id],
     )?;
 
@@ -296,6 +293,14 @@ pub fn merge_artists(
         params![source_artist_id],
     )?;
 
+    // Record redirect for old ID resolution.
+    let now = unix_now();
+    tx.execute(
+        "INSERT OR REPLACE INTO artist_id_redirect (old_artist_id, new_artist_id, merged_at) \
+         VALUES (?1, ?2, ?3)",
+        params![source_artist_id, target_artist_id, now],
+    )?;
+
     // Delete the source artist row.
     tx.execute(
         "DELETE FROM artists WHERE artist_id = ?1",
@@ -310,56 +315,139 @@ pub fn merge_artists(
 // ── upsert_artist_if_absent ───────────────────────────────────────────────────
 
 /// Inserts the artist if no row with the same `artist_id` exists yet.
-///
-/// Used by the community node to replay `ArtistUpserted` events without
-/// overwriting locally-resolved `created_at` timestamps.
-///
-/// # Errors
-///
-/// Returns [`DbError::Rusqlite`] if the SQL `INSERT OR IGNORE` fails.
 pub fn upsert_artist_if_absent(conn: &Connection, artist: &Artist) -> Result<(), DbError> {
     conn.execute(
-        "INSERT OR IGNORE INTO artists (artist_id, name, name_lower, created_at) \
-         VALUES (?1, ?2, ?3, ?4)",
-        params![artist.artist_id, artist.name, artist.name_lower, artist.created_at],
+        "INSERT OR IGNORE INTO artists (artist_id, name, name_lower, sort_name, type_id, area, \
+         img_url, url, begin_year, end_year, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            artist.artist_id, artist.name, artist.name_lower,
+            artist.sort_name, artist.type_id, artist.area,
+            artist.img_url, artist.url, artist.begin_year, artist.end_year,
+            artist.created_at, artist.updated_at,
+        ],
     )?;
     Ok(())
+}
+
+// ── Artist credit operations ────────────────────────────────────────────────
+
+/// Creates an artist credit with its constituent names. Returns the credit with
+/// the assigned `id` populated.
+pub fn create_artist_credit(
+    conn: &Connection,
+    display_name: &str,
+    names: &[(String, String, String)],  // (artist_id, credited_name, join_phrase)
+) -> Result<ArtistCredit, DbError> {
+    let now = unix_now();
+
+    conn.execute(
+        "INSERT INTO artist_credit (display_name, created_at) VALUES (?1, ?2)",
+        params![display_name, now],
+    )?;
+    let credit_id = conn.last_insert_rowid();
+
+    let mut credit_names = Vec::with_capacity(names.len());
+    for (pos, (artist_id, name, join_phrase)) in names.iter().enumerate() {
+        #[expect(clippy::cast_possible_wrap, reason = "artist credit position count never approaches i64::MAX")]
+        let position = pos as i64;
+        conn.execute(
+            "INSERT INTO artist_credit_name (artist_credit_id, artist_id, position, name, join_phrase) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![credit_id, artist_id, position, name, join_phrase],
+        )?;
+        let acn_id = conn.last_insert_rowid();
+        credit_names.push(ArtistCreditName {
+            id:               acn_id,
+            artist_credit_id: credit_id,
+            artist_id:        artist_id.clone(),
+            position,
+            name:             name.clone(),
+            join_phrase:      join_phrase.clone(),
+        });
+    }
+
+    Ok(ArtistCredit {
+        id:           credit_id,
+        display_name: display_name.to_string(),
+        created_at:   now,
+        names:        credit_names,
+    })
+}
+
+/// Creates a simple single-artist credit and returns it.
+pub fn create_single_artist_credit(
+    conn: &Connection,
+    artist: &Artist,
+) -> Result<ArtistCredit, DbError> {
+    create_artist_credit(
+        conn,
+        &artist.name,
+        &[(artist.artist_id.clone(), artist.name.clone(), String::new())],
+    )
+}
+
+/// Retrieves an artist credit by ID, including its constituent names.
+#[expect(dead_code, reason = "used by query API in Sprint 2")]
+pub fn get_artist_credit(conn: &Connection, credit_id: i64) -> Result<Option<ArtistCredit>, DbError> {
+    let credit: Option<(i64, String, i64)> = conn.query_row(
+        "SELECT id, display_name, created_at FROM artist_credit WHERE id = ?1",
+        params![credit_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).optional()?;
+
+    let Some((id, display_name, created_at)) = credit else {
+        return Ok(None);
+    };
+
+    let mut stmt = conn.prepare(
+        "SELECT id, artist_credit_id, artist_id, position, name, join_phrase \
+         FROM artist_credit_name WHERE artist_credit_id = ?1 ORDER BY position",
+    )?;
+    let names: Vec<ArtistCreditName> = stmt.query_map(params![id], |row| {
+        Ok(ArtistCreditName {
+            id:               row.get(0)?,
+            artist_credit_id: row.get(1)?,
+            artist_id:        row.get(2)?,
+            position:         row.get(3)?,
+            name:             row.get(4)?,
+            join_phrase:      row.get(5)?,
+        })
+    })?.collect::<Result<_, _>>()?;
+
+    Ok(Some(ArtistCredit { id, display_name, created_at, names }))
 }
 
 // ── upsert_feed ───────────────────────────────────────────────────────────────
 
 /// Inserts or updates a feed row keyed on `feed_guid`.
-///
-/// # Errors
-///
-/// Returns [`DbError::Rusqlite`] if the SQL upsert fails.
 pub fn upsert_feed(conn: &Connection, feed: &Feed) -> Result<(), DbError> {
     conn.execute(
-        "INSERT INTO feeds (feed_guid, feed_url, title, title_lower, artist_id, description, image_url, \
+        "INSERT INTO feeds (feed_guid, feed_url, title, title_lower, artist_credit_id, description, image_url, \
          language, explicit, itunes_type, episode_count, newest_item_at, oldest_item_at, created_at, \
          updated_at, raw_medium) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16) \
          ON CONFLICT(feed_guid) DO UPDATE SET \
-           feed_url       = excluded.feed_url, \
-           title          = excluded.title, \
-           title_lower    = excluded.title_lower, \
-           artist_id      = excluded.artist_id, \
-           description    = excluded.description, \
-           image_url      = excluded.image_url, \
-           language       = excluded.language, \
-           explicit       = excluded.explicit, \
-           itunes_type    = excluded.itunes_type, \
-           episode_count  = excluded.episode_count, \
-           newest_item_at = excluded.newest_item_at, \
-           oldest_item_at = excluded.oldest_item_at, \
-           updated_at     = excluded.updated_at, \
-           raw_medium     = excluded.raw_medium",
+           feed_url         = excluded.feed_url, \
+           title            = excluded.title, \
+           title_lower      = excluded.title_lower, \
+           artist_credit_id = excluded.artist_credit_id, \
+           description      = excluded.description, \
+           image_url        = excluded.image_url, \
+           language         = excluded.language, \
+           explicit         = excluded.explicit, \
+           itunes_type      = excluded.itunes_type, \
+           episode_count    = excluded.episode_count, \
+           newest_item_at   = excluded.newest_item_at, \
+           oldest_item_at   = excluded.oldest_item_at, \
+           updated_at       = excluded.updated_at, \
+           raw_medium       = excluded.raw_medium",
         params![
             feed.feed_guid,
             feed.feed_url,
             feed.title,
             feed.title_lower,
-            feed.artist_id,
+            feed.artist_credit_id,
             feed.description,
             feed.image_url,
             feed.language,
@@ -379,35 +467,31 @@ pub fn upsert_feed(conn: &Connection, feed: &Feed) -> Result<(), DbError> {
 // ── upsert_track ──────────────────────────────────────────────────────────────
 
 /// Inserts or updates a track row keyed on `track_guid`.
-///
-/// # Errors
-///
-/// Returns [`DbError::Rusqlite`] if the SQL upsert fails.
 pub fn upsert_track(conn: &Connection, track: &Track) -> Result<(), DbError> {
     conn.execute(
-        "INSERT INTO tracks (track_guid, feed_guid, artist_id, title, title_lower, pub_date, \
+        "INSERT INTO tracks (track_guid, feed_guid, artist_credit_id, title, title_lower, pub_date, \
          duration_secs, enclosure_url, enclosure_type, enclosure_bytes, track_number, season, \
          explicit, description, created_at, updated_at) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16) \
          ON CONFLICT(track_guid) DO UPDATE SET \
-           feed_guid       = excluded.feed_guid, \
-           artist_id       = excluded.artist_id, \
-           title           = excluded.title, \
-           title_lower     = excluded.title_lower, \
-           pub_date        = excluded.pub_date, \
-           duration_secs   = excluded.duration_secs, \
-           enclosure_url   = excluded.enclosure_url, \
-           enclosure_type  = excluded.enclosure_type, \
-           enclosure_bytes = excluded.enclosure_bytes, \
-           track_number    = excluded.track_number, \
-           season          = excluded.season, \
-           explicit        = excluded.explicit, \
-           description     = excluded.description, \
-           updated_at      = excluded.updated_at",
+           feed_guid        = excluded.feed_guid, \
+           artist_credit_id = excluded.artist_credit_id, \
+           title            = excluded.title, \
+           title_lower      = excluded.title_lower, \
+           pub_date         = excluded.pub_date, \
+           duration_secs    = excluded.duration_secs, \
+           enclosure_url    = excluded.enclosure_url, \
+           enclosure_type   = excluded.enclosure_type, \
+           enclosure_bytes  = excluded.enclosure_bytes, \
+           track_number     = excluded.track_number, \
+           season           = excluded.season, \
+           explicit         = excluded.explicit, \
+           description      = excluded.description, \
+           updated_at       = excluded.updated_at",
         params![
             track.track_guid,
             track.feed_guid,
-            track.artist_id,
+            track.artist_credit_id,
             track.title,
             track.title_lower,
             track.pub_date,
@@ -429,11 +513,6 @@ pub fn upsert_track(conn: &Connection, track: &Track) -> Result<(), DbError> {
 // ── replace_payment_routes ────────────────────────────────────────────────────
 
 /// Deletes all payment routes for `track_guid` and inserts the new `routes`.
-///
-/// # Errors
-///
-/// Returns [`DbError::Rusqlite`] if any SQL operation fails, or
-/// [`DbError::Json`] if a `route_type` variant cannot be serialised.
 pub fn replace_payment_routes(
     conn: &Connection,
     track_guid: &str,
@@ -463,13 +542,40 @@ pub fn replace_payment_routes(
     Ok(())
 }
 
+// ── replace_feed_payment_routes ─────────────────────────────────────────────
+
+/// Deletes all feed-level payment routes for `feed_guid` and inserts `routes`.
+pub fn replace_feed_payment_routes(
+    conn: &Connection,
+    feed_guid: &str,
+    routes: &[FeedPaymentRoute],
+) -> Result<(), DbError> {
+    conn.execute("DELETE FROM feed_payment_routes WHERE feed_guid = ?1", params![feed_guid])?;
+    for r in routes {
+        let route_type = serde_json::to_string(&r.route_type)?;
+        let route_type = route_type.trim_matches('"');
+        conn.execute(
+            "INSERT INTO feed_payment_routes (feed_guid, recipient_name, route_type, address, \
+             custom_key, custom_value, split, fee) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                r.feed_guid,
+                r.recipient_name,
+                route_type,
+                r.address,
+                r.custom_key,
+                r.custom_value,
+                r.split,
+                i64::from(r.fee),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
 // ── replace_value_time_splits ─────────────────────────────────────────────────
 
 /// Deletes all value-time splits for `source_track_guid` and inserts `splits`.
-///
-/// # Errors
-///
-/// Returns [`DbError::Rusqlite`] if any SQL operation fails.
 pub fn replace_value_time_splits(
     conn: &Connection,
     source_track_guid: &str,
@@ -501,11 +607,6 @@ pub fn replace_value_time_splits(
 // ── insert_event ──────────────────────────────────────────────────────────────
 
 /// Inserts a single event row and returns the assigned monotonic `seq`.
-///
-/// # Errors
-///
-/// Returns [`DbError::Json`] if `event_type` or `warnings` cannot be
-/// serialised, or [`DbError::Rusqlite`] if the SQL insert fails.
 #[expect(clippy::too_many_arguments, reason = "all fields are required for a complete event row")]
 pub fn insert_event(
     conn:         &Connection,
@@ -538,10 +639,6 @@ pub fn insert_event(
 // ── upsert_feed_crawl_cache ───────────────────────────────────────────────────
 
 /// Records the latest content hash and crawl timestamp for `feed_url`.
-///
-/// # Errors
-///
-/// Returns [`DbError::Rusqlite`] if the SQL upsert fails.
 pub fn upsert_feed_crawl_cache(
     conn:         &Connection,
     feed_url:     &str,
@@ -562,12 +659,6 @@ pub fn upsert_feed_crawl_cache(
 // ── get_events_since ──────────────────────────────────────────────────────────
 
 /// Returns up to `limit` events with `seq > after_seq`, ordered ascending.
-///
-/// # Errors
-///
-/// Returns [`DbError::Rusqlite`] if the query fails, or [`DbError::Json`] if
-/// any stored `event_type`, `payload_json`, or `warnings_json` cannot be
-/// deserialised.
 pub fn get_events_since(
     conn:       &Connection,
     after_seq:  i64,
@@ -596,13 +687,9 @@ pub fn get_events_since(
     for row in rows {
         let (event_id, et_str, payload_json, subject_guid, signed_by, signature, seq, created_at, warnings_json) = row?;
 
-        // Deserialize event_type: re-add quotes so serde_json can parse the snake_case variant
         let et_quoted = format!("\"{et_str}\"");
         let event_type: EventType = serde_json::from_str(&et_quoted)?;
 
-        // payload_json stores the inner payload struct (e.g. ArtistUpsertedPayload).
-        // EventPayload uses #[serde(tag="type", content="data")] so we must wrap it
-        // back into the tagged envelope before deserializing through the enum.
         let tagged = format!(r#"{{"type":"{et_str}","data":{payload_json}}}"#);
         let payload: EventPayload = serde_json::from_str(&tagged)?;
         let warnings: Vec<String> = serde_json::from_str(&warnings_json)?;
@@ -611,8 +698,6 @@ pub fn get_events_since(
             event_id,
             event_type,
             payload,
-            // payload_json carries the original inner-struct JSON so that
-            // verify_event_signature can hash the same bytes that were signed.
             payload_json: payload_json.clone(),
             subject_guid,
             signed_by,
@@ -629,10 +714,6 @@ pub fn get_events_since(
 // ── get_event_refs_since ──────────────────────────────────────────────────────
 
 /// Returns lightweight `(event_id, seq)` references for all events with `seq >= since_seq`.
-///
-/// # Errors
-///
-/// Returns [`DbError::Rusqlite`] if the query or row mapping fails.
 pub fn get_event_refs_since(
     conn:      &Connection,
     since_seq: i64,
@@ -658,10 +739,6 @@ pub fn get_event_refs_since(
 // ── upsert_node_sync_state ────────────────────────────────────────────────────
 
 /// Records or updates the last-seen sequence number for a peer node.
-///
-/// # Errors
-///
-/// Returns [`DbError::Rusqlite`] if the SQL upsert fails.
 pub fn upsert_node_sync_state(
     conn:         &Connection,
     node_pubkey:  &str,
@@ -683,25 +760,16 @@ pub fn upsert_node_sync_state(
 
 /// A peer node registered for push fan-out.
 pub struct PeerNode {
-    /// Hex-encoded ed25519 public key identifying this peer.
     pub node_pubkey:          String,
-    /// Base URL where this peer's `/sync/push` endpoint is reachable.
     pub node_url:             String,
-    /// Unix timestamp (seconds) when this peer was first seen.
     #[expect(dead_code, reason = "returned in GET /sync/peers for future use")]
     pub discovered_at:        i64,
-    /// Unix timestamp (seconds) of the last successful push, if any.
     pub last_push_at:         Option<i64>,
-    /// Number of consecutive delivery failures; peers at 5+ are skipped.
     #[expect(dead_code, reason = "used indirectly via SQL WHERE clause in get_push_peers")]
     pub consecutive_failures: i64,
 }
 
 /// Returns all peers with `consecutive_failures < 5`.
-///
-/// # Errors
-///
-/// Returns [`DbError::Rusqlite`] if the query or row mapping fails.
 pub fn get_push_peers(conn: &Connection) -> Result<Vec<PeerNode>, DbError> {
     let mut stmt = conn.prepare(
         "SELECT node_pubkey, node_url, discovered_at, last_push_at, consecutive_failures \
@@ -726,13 +794,6 @@ pub fn get_push_peers(conn: &Connection) -> Result<Vec<PeerNode>, DbError> {
 }
 
 /// Upserts a peer node record.
-///
-/// On conflict updates `node_url` only — preserves `discovered_at` and does
-/// **not** reset `consecutive_failures` (re-registration resets separately).
-///
-/// # Errors
-///
-/// Returns [`DbError::Rusqlite`] if the SQL upsert fails.
 pub fn upsert_peer_node(
     conn:        &Connection,
     node_pubkey: &str,
@@ -748,12 +809,7 @@ pub fn upsert_peer_node(
     Ok(())
 }
 
-/// Records a successful push delivery: updates `last_push_at` and resets
-/// `consecutive_failures` to 0.
-///
-/// # Errors
-///
-/// Returns [`DbError::Rusqlite`] if the SQL update fails.
+/// Records a successful push delivery.
 pub fn record_push_success(conn: &Connection, node_pubkey: &str, now: i64) -> Result<(), DbError> {
     conn.execute(
         "UPDATE peer_nodes SET last_push_at = ?1, consecutive_failures = 0 \
@@ -764,10 +820,6 @@ pub fn record_push_success(conn: &Connection, node_pubkey: &str, now: i64) -> Re
 }
 
 /// Increments `consecutive_failures` by 1 for the given peer.
-///
-/// # Errors
-///
-/// Returns [`DbError::Rusqlite`] if the SQL update fails.
 pub fn increment_peer_failures(conn: &Connection, node_pubkey: &str) -> Result<(), DbError> {
     conn.execute(
         "UPDATE peer_nodes SET consecutive_failures = consecutive_failures + 1 \
@@ -777,11 +829,7 @@ pub fn increment_peer_failures(conn: &Connection, node_pubkey: &str) -> Result<(
     Ok(())
 }
 
-/// Resets `consecutive_failures` to 0 for the given peer (called on re-registration).
-///
-/// # Errors
-///
-/// Returns [`DbError::Rusqlite`] if the SQL update fails.
+/// Resets `consecutive_failures` to 0 for the given peer.
 pub fn reset_peer_failures(conn: &Connection, node_pubkey: &str) -> Result<(), DbError> {
     conn.execute(
         "UPDATE peer_nodes SET consecutive_failures = 0 WHERE node_pubkey = ?1",
@@ -794,11 +842,6 @@ pub fn reset_peer_failures(conn: &Connection, node_pubkey: &str) -> Result<(), D
 ///
 /// Returns `Some(seq)` if the event was newly inserted, or `None` if a row
 /// with the same `event_id` already existed (idempotent community-side apply).
-///
-/// # Errors
-///
-/// Returns [`DbError::Json`] if `event_type` or `warnings` cannot be
-/// serialised, or [`DbError::Rusqlite`] if the SQL fails.
 #[expect(clippy::too_many_arguments, reason = "all fields are required for a complete event row")]
 pub fn insert_event_idempotent(
     conn:         &Connection,
@@ -814,7 +857,6 @@ pub fn insert_event_idempotent(
     let et_str = event_type_str(event_type)?;
     let warnings_json = serde_json::to_string(warnings)?;
 
-    // Use INSERT OR IGNORE so a duplicate event_id is a no-op.
     let sql = "INSERT OR IGNORE INTO events \
         (event_id, event_type, payload_json, subject_guid, signed_by, signature, seq, created_at, warnings_json) \
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, (SELECT COALESCE(MAX(seq),0)+1 FROM events), ?7, ?8)";
@@ -828,7 +870,6 @@ pub fn insert_event_idempotent(
         return Ok(None);
     }
 
-    // Retrieve the seq that was just assigned.
     let seq: i64 = conn.query_row(
         "SELECT seq FROM events WHERE event_id = ?1",
         rusqlite::params![event_id],
@@ -841,10 +882,6 @@ pub fn insert_event_idempotent(
 // ── get_node_sync_cursor ──────────────────────────────────────────────────────
 
 /// Returns the `last_seq` cursor stored for `node_pubkey`, or `0` if none exists.
-///
-/// # Errors
-///
-/// Returns [`DbError::Rusqlite`] if the query fails.
 pub fn get_node_sync_cursor(conn: &Connection, node_pubkey: &str) -> Result<i64, DbError> {
     let seq: Option<i64> = conn.query_row(
         "SELECT last_seq FROM node_sync_state WHERE node_pubkey = ?1",
@@ -857,16 +894,12 @@ pub fn get_node_sync_cursor(conn: &Connection, node_pubkey: &str) -> Result<i64,
 // ── get_existing_feed ─────────────────────────────────────────────────────────
 
 /// Looks up the feed row whose `feed_url` matches, returning `None` if absent.
-///
-/// # Errors
-///
-/// Returns [`DbError::Rusqlite`] if the query or row mapping fails.
 pub fn get_existing_feed(
     conn:     &Connection,
     feed_url: &str,
 ) -> Result<Option<Feed>, DbError> {
     let result = conn.query_row(
-        "SELECT feed_guid, feed_url, title, title_lower, artist_id, description, image_url, \
+        "SELECT feed_guid, feed_url, title, title_lower, artist_credit_id, description, image_url, \
          language, explicit, itunes_type, episode_count, newest_item_at, oldest_item_at, \
          created_at, updated_at, raw_medium \
          FROM feeds WHERE feed_url = ?1",
@@ -874,22 +907,22 @@ pub fn get_existing_feed(
         |row| {
             let explicit_i: i64 = row.get(8)?;
             Ok(Feed {
-                feed_guid:      row.get(0)?,
-                feed_url:       row.get(1)?,
-                title:          row.get(2)?,
-                title_lower:    row.get(3)?,
-                artist_id:      row.get(4)?,
-                description:    row.get(5)?,
-                image_url:      row.get(6)?,
-                language:       row.get(7)?,
-                explicit:       explicit_i != 0,
-                itunes_type:    row.get(9)?,
-                episode_count:  row.get(10)?,
-                newest_item_at: row.get(11)?,
-                oldest_item_at: row.get(12)?,
-                created_at:     row.get(13)?,
-                updated_at:     row.get(14)?,
-                raw_medium:     row.get(15)?,
+                feed_guid:        row.get(0)?,
+                feed_url:         row.get(1)?,
+                title:            row.get(2)?,
+                title_lower:      row.get(3)?,
+                artist_credit_id: row.get(4)?,
+                description:      row.get(5)?,
+                image_url:        row.get(6)?,
+                language:         row.get(7)?,
+                explicit:         explicit_i != 0,
+                itunes_type:      row.get(9)?,
+                episode_count:    row.get(10)?,
+                newest_item_at:   row.get(11)?,
+                oldest_item_at:   row.get(12)?,
+                created_at:       row.get(13)?,
+                updated_at:       row.get(14)?,
+                raw_medium:       row.get(15)?,
             })
         },
     ).optional()?;
@@ -903,28 +936,21 @@ pub fn get_existing_feed(
 // `upsert_feed` and `upsert_track` functions. This is intentional: those
 // functions take `&Connection`, but inside a transaction we must use the
 // `&Transaction` handle so all writes participate in the same atomic commit.
-// Extracting shared SQL into `const` strings would add complexity for no
-// safety benefit; the duplication is localised here and should stay.
 /// Writes a complete feed ingest atomically and returns the new event `seq` values.
 ///
-/// Upserts the artist, feed, all tracks (with payment routes and value-time
-/// splits), and inserts the supplied event rows — all inside one `SQLite`
-/// transaction. Returns the monotonically assigned `seq` for each event in
-/// the same order as `event_rows`.
-///
-/// # Errors
-///
-/// Returns [`DbError::Rusqlite`] if any SQL operation fails (the transaction
-/// is automatically rolled back), or [`DbError::Json`] if an `event_type` or
-/// `route_type` variant cannot be serialised.
+/// Upserts the artist, creates the artist credit, upserts the feed (with feed
+/// payment routes), all tracks (with payment routes and value-time splits),
+/// and inserts the supplied event rows — all inside one `SQLite` transaction.
 #[expect(clippy::too_many_lines, reason = "single atomic transaction — splitting would obscure the transactional boundary")]
 #[expect(clippy::needless_pass_by_value, reason = "takes ownership to make the transaction boundary clear at call sites")]
 pub fn ingest_transaction(
-    conn:        &mut Connection,
-    artist:      Artist,
-    feed:        Feed,
-    tracks:      Vec<(Track, Vec<PaymentRoute>, Vec<ValueTimeSplit>)>,
-    event_rows:  Vec<EventRow>,
+    conn:               &mut Connection,
+    artist:             Artist,
+    artist_credit:      ArtistCredit,
+    feed:               Feed,
+    feed_routes:        Vec<FeedPaymentRoute>,
+    tracks:             Vec<(Track, Vec<PaymentRoute>, Vec<ValueTimeSplit>)>,
+    event_rows:         Vec<EventRow>,
 ) -> Result<Vec<i64>, DbError> {
     let tx = conn.transaction()?;
 
@@ -939,8 +965,15 @@ pub fn ingest_transaction(
 
         if existing.is_none() {
             tx.execute(
-                "INSERT INTO artists (artist_id, name, name_lower, created_at) VALUES (?1, ?2, ?3, ?4)",
-                params![artist.artist_id, artist.name, name_lower, artist.created_at],
+                "INSERT INTO artists (artist_id, name, name_lower, sort_name, type_id, area, \
+                 img_url, url, begin_year, end_year, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    artist.artist_id, artist.name, name_lower,
+                    artist.sort_name, artist.type_id, artist.area,
+                    artist.img_url, artist.url, artist.begin_year, artist.end_year,
+                    artist.created_at, artist.updated_at,
+                ],
             )?;
             tx.execute(
                 "INSERT OR IGNORE INTO artist_aliases (alias_lower, artist_id, created_at) \
@@ -948,7 +981,6 @@ pub fn ingest_transaction(
                 params![name_lower, artist.artist_id, artist.created_at],
             )?;
         } else {
-            // Back-fill alias for pre-existing artist rows that predate the alias table.
             tx.execute(
                 "INSERT OR IGNORE INTO artist_aliases (alias_lower, artist_id, created_at) \
                  VALUES (?1, ?2, ?3)",
@@ -957,33 +989,50 @@ pub fn ingest_transaction(
         }
     }
 
-    // 2. Upsert feed
+    // 2. Insert artist credit (idempotent via INSERT OR IGNORE on PK)
+    {
+        tx.execute(
+            "INSERT OR IGNORE INTO artist_credit (id, display_name, created_at) \
+             VALUES (?1, ?2, ?3)",
+            params![artist_credit.id, artist_credit.display_name, artist_credit.created_at],
+        )?;
+        for acn in &artist_credit.names {
+            tx.execute(
+                "INSERT OR IGNORE INTO artist_credit_name \
+                 (artist_credit_id, artist_id, position, name, join_phrase) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![acn.artist_credit_id, acn.artist_id, acn.position, acn.name, acn.join_phrase],
+            )?;
+        }
+    }
+
+    // 3. Upsert feed
     tx.execute(
-        "INSERT INTO feeds (feed_guid, feed_url, title, title_lower, artist_id, description, image_url, \
+        "INSERT INTO feeds (feed_guid, feed_url, title, title_lower, artist_credit_id, description, image_url, \
          language, explicit, itunes_type, episode_count, newest_item_at, oldest_item_at, created_at, \
          updated_at, raw_medium) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16) \
          ON CONFLICT(feed_guid) DO UPDATE SET \
-           feed_url       = excluded.feed_url, \
-           title          = excluded.title, \
-           title_lower    = excluded.title_lower, \
-           artist_id      = excluded.artist_id, \
-           description    = excluded.description, \
-           image_url      = excluded.image_url, \
-           language       = excluded.language, \
-           explicit       = excluded.explicit, \
-           itunes_type    = excluded.itunes_type, \
-           episode_count  = excluded.episode_count, \
-           newest_item_at = excluded.newest_item_at, \
-           oldest_item_at = excluded.oldest_item_at, \
-           updated_at     = excluded.updated_at, \
-           raw_medium     = excluded.raw_medium",
+           feed_url         = excluded.feed_url, \
+           title            = excluded.title, \
+           title_lower      = excluded.title_lower, \
+           artist_credit_id = excluded.artist_credit_id, \
+           description      = excluded.description, \
+           image_url        = excluded.image_url, \
+           language         = excluded.language, \
+           explicit         = excluded.explicit, \
+           itunes_type      = excluded.itunes_type, \
+           episode_count    = excluded.episode_count, \
+           newest_item_at   = excluded.newest_item_at, \
+           oldest_item_at   = excluded.oldest_item_at, \
+           updated_at       = excluded.updated_at, \
+           raw_medium       = excluded.raw_medium",
         params![
             feed.feed_guid,
             feed.feed_url,
             feed.title,
             feed.title_lower,
-            feed.artist_id,
+            feed.artist_credit_id,
             feed.description,
             feed.image_url,
             feed.language,
@@ -998,33 +1047,54 @@ pub fn ingest_transaction(
         ],
     )?;
 
-    // 3. Tracks, routes, splits
-    for (track, routes, splits) in &tracks {
-        // upsert track
+    // 3b. Replace feed-level payment routes
+    tx.execute("DELETE FROM feed_payment_routes WHERE feed_guid = ?1", params![feed.feed_guid])?;
+    for r in &feed_routes {
+        let route_type = serde_json::to_string(&r.route_type)?;
+        let route_type = route_type.trim_matches('"');
         tx.execute(
-            "INSERT INTO tracks (track_guid, feed_guid, artist_id, title, title_lower, pub_date, \
+            "INSERT INTO feed_payment_routes (feed_guid, recipient_name, route_type, address, \
+             custom_key, custom_value, split, fee) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                r.feed_guid,
+                r.recipient_name,
+                route_type,
+                r.address,
+                r.custom_key,
+                r.custom_value,
+                r.split,
+                i64::from(r.fee),
+            ],
+        )?;
+    }
+
+    // 4. Tracks, routes, splits
+    for (track, routes, splits) in &tracks {
+        tx.execute(
+            "INSERT INTO tracks (track_guid, feed_guid, artist_credit_id, title, title_lower, pub_date, \
              duration_secs, enclosure_url, enclosure_type, enclosure_bytes, track_number, season, \
              explicit, description, created_at, updated_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16) \
              ON CONFLICT(track_guid) DO UPDATE SET \
-               feed_guid       = excluded.feed_guid, \
-               artist_id       = excluded.artist_id, \
-               title           = excluded.title, \
-               title_lower     = excluded.title_lower, \
-               pub_date        = excluded.pub_date, \
-               duration_secs   = excluded.duration_secs, \
-               enclosure_url   = excluded.enclosure_url, \
-               enclosure_type  = excluded.enclosure_type, \
-               enclosure_bytes = excluded.enclosure_bytes, \
-               track_number    = excluded.track_number, \
-               season          = excluded.season, \
-               explicit        = excluded.explicit, \
-               description     = excluded.description, \
-               updated_at      = excluded.updated_at",
+               feed_guid        = excluded.feed_guid, \
+               artist_credit_id = excluded.artist_credit_id, \
+               title            = excluded.title, \
+               title_lower      = excluded.title_lower, \
+               pub_date         = excluded.pub_date, \
+               duration_secs    = excluded.duration_secs, \
+               enclosure_url    = excluded.enclosure_url, \
+               enclosure_type   = excluded.enclosure_type, \
+               enclosure_bytes  = excluded.enclosure_bytes, \
+               track_number     = excluded.track_number, \
+               season           = excluded.season, \
+               explicit         = excluded.explicit, \
+               description      = excluded.description, \
+               updated_at       = excluded.updated_at",
             params![
                 track.track_guid,
                 track.feed_guid,
-                track.artist_id,
+                track.artist_credit_id,
                 track.title,
                 track.title_lower,
                 track.pub_date,
@@ -1087,7 +1157,7 @@ pub fn ingest_transaction(
         }
     }
 
-    // 4. Insert events, collect seqs
+    // 5. Insert events, collect seqs
     let mut seqs = Vec::new();
     for er in &event_rows {
         let et_str = event_type_str(&er.event_type)?;
@@ -1113,7 +1183,7 @@ pub fn ingest_transaction(
         seqs.push(seq);
     }
 
-    // 5. Commit
+    // 6. Commit
     tx.commit()?;
 
     Ok(seqs)

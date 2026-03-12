@@ -1,5 +1,3 @@
-// Rust guideline compliant (M-APP-ERROR, M-MODULE-DOCS) — 2026-03-09
-
 //! Shared event-application logic used by both the poll-loop fallback and the
 //! push-receiver handler in community mode.
 //!
@@ -39,10 +37,6 @@ pub(crate) struct ApplySummary {
 /// All mutations go through `INSERT OR IGNORE` / upsert variants so that
 /// re-delivering the same event is safe. The caller must have already verified
 /// the event signature before calling this function.
-///
-/// # Errors
-///
-/// Returns [`db::DbError`] if any SQL operation fails.
 pub(crate) fn apply_single_event(
     db:          &db::Db,
     node_pubkey: &str,
@@ -54,9 +48,6 @@ pub(crate) fn apply_single_event(
         .as_secs()
         .cast_signed();
 
-    // Recover from mutex poison: SQLite-backed, safe to continue from last
-    // consistent on-disk state after a panic.
-    // `mut` needed for the ArtistMerged arm that calls merge_artists(&mut conn).
     let mut conn = db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
     match &ev.payload {
@@ -65,15 +56,25 @@ pub(crate) fn apply_single_event(
         }
         event::EventPayload::FeedUpserted(p) => {
             db::upsert_artist_if_absent(&conn, &p.artist)?;
+            // Ensure artist credit exists before upserting feed
+            upsert_artist_credit_if_absent(&conn, &p.artist_credit)?;
             db::upsert_feed(&conn, &p.feed)?;
         }
         event::EventPayload::TrackUpserted(p) => {
+            // Ensure artist credit exists before upserting track
+            upsert_artist_credit_if_absent(&conn, &p.artist_credit)?;
             db::upsert_track(&conn, &p.track)?;
             db::replace_payment_routes(&conn, &p.track.track_guid, &p.routes)?;
             db::replace_value_time_splits(&conn, &p.track.track_guid, &p.value_time_splits)?;
         }
         event::EventPayload::RoutesReplaced(p) => {
             db::replace_payment_routes(&conn, &p.track_guid, &p.routes)?;
+        }
+        event::EventPayload::ArtistCreditCreated(p) => {
+            upsert_artist_credit_if_absent(&conn, &p.artist_credit)?;
+        }
+        event::EventPayload::FeedRoutesReplaced(p) => {
+            db::replace_feed_payment_routes(&conn, &p.feed_guid, &p.routes)?;
         }
         event::EventPayload::FeedRetired(p) => {
             eprintln!(
@@ -110,7 +111,6 @@ pub(crate) fn apply_single_event(
     )?;
 
     if let Some(seq) = seq_opt {
-        // Advance the cursor only when newly applied.
         db::upsert_node_sync_state(&conn, node_pubkey, ev.seq, now)?;
         return Ok(ApplyOutcome::Applied(seq));
     }
@@ -118,16 +118,30 @@ pub(crate) fn apply_single_event(
     Ok(ApplyOutcome::Duplicate)
 }
 
+/// Helper: insert an artist credit and its names if they don't already exist.
+fn upsert_artist_credit_if_absent(
+    conn: &rusqlite::Connection,
+    credit: &crate::model::ArtistCredit,
+) -> Result<(), db::DbError> {
+    conn.execute(
+        "INSERT OR IGNORE INTO artist_credit (id, display_name, created_at) \
+         VALUES (?1, ?2, ?3)",
+        rusqlite::params![credit.id, credit.display_name, credit.created_at],
+    )?;
+    for acn in &credit.names {
+        conn.execute(
+            "INSERT OR IGNORE INTO artist_credit_name \
+             (artist_credit_id, artist_id, position, name, join_phrase) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![acn.artist_credit_id, acn.artist_id, acn.position, acn.name, acn.join_phrase],
+        )?;
+    }
+    Ok(())
+}
+
 // ── apply_events ─────────────────────────────────────────────────────────────
 
 /// Verify and apply a batch of events to the local DB.
-///
-/// Each event is verified individually. Signature failures increment `rejected`
-/// and are skipped. Each application is dispatched via `spawn_blocking` so the
-/// async executor is not blocked during DB writes.
-///
-/// Returns an [`ApplySummary`] with per-category counts and the highest seq
-/// seen in this batch.
 pub(crate) async fn apply_events(
     db:          db::Db,
     node_pubkey: &str,
@@ -165,7 +179,6 @@ pub(crate) async fn apply_events(
                 if s > summary.max_seq {
                     summary.max_seq = s;
                 }
-                // Track the primary seq (wire seq, not local seq) for cursor advance.
                 if seq > summary.max_seq {
                     summary.max_seq = seq;
                 }

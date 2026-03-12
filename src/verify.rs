@@ -181,6 +181,7 @@ impl ChainSpec {
 /// Add a `match` arm below and declare it in `src/verifiers/mod.rs`. No other
 /// files need to change. See the [module-level docs](self) for the full
 /// four-step procedure.
+#[expect(clippy::needless_pass_by_value, reason = "takes ownership so callers can move the token into the chain")]
 pub fn build_chain(spec: &ChainSpec, crawl_token: String) -> VerifierChain {
     use crate::verifiers::{
         content_hash::ContentHashVerifier,

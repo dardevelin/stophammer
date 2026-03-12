@@ -19,13 +19,13 @@ impl Verifier for EnclosureTypeVerifier {
             return VerifyResult::Pass;
         };
         for track in &feed_data.tracks {
-            if let Some(mime) = &track.enclosure_type {
-                if mime.starts_with("video/") {
-                    return VerifyResult::Warn(format!(
-                        "track '{}' has video enclosure type '{mime}'",
-                        track.track_guid
-                    ));
-                }
+            if let Some(mime) = &track.enclosure_type
+                && mime.starts_with("video/")
+            {
+                return VerifyResult::Warn(format!(
+                    "track '{}' has video enclosure type '{mime}'",
+                    track.track_guid
+                ));
             }
         }
         VerifyResult::Pass

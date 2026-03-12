@@ -106,22 +106,21 @@ async fn run_community(
     // Auto-discover the primary's signing pubkey if PRIMARY_PUBKEY is not
     // explicitly configured. Fetches GET {PRIMARY_URL}/node/info with retries
     // so the community node works without any manual key distribution.
-    let primary_pubkey_hex = match std::env::var("PRIMARY_PUBKEY") {
-        Ok(pk) => pk,
-        Err(_) => {
-            let discovery_client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(5))
-                .build()
-                .expect("failed to build discovery client");
-            let primary_url_for_discovery = std::env::var("PRIMARY_URL")
-                .expect("PRIMARY_URL env var required in community mode");
-            community::fetch_primary_pubkey(&discovery_client, &primary_url_for_discovery, 10)
-                .await
-                .unwrap_or_else(|| {
-                    eprintln!("[community] WARNING: using own pubkey as primary — push events will be rejected");
-                    pubkey.clone()
-                })
-        }
+    let primary_pubkey_hex = if let Ok(pk) = std::env::var("PRIMARY_PUBKEY") {
+        pk
+    } else {
+        let discovery_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("failed to build discovery client");
+        let primary_url_for_discovery = std::env::var("PRIMARY_URL")
+            .expect("PRIMARY_URL env var required in community mode");
+        community::fetch_primary_pubkey(&discovery_client, &primary_url_for_discovery, 10)
+            .await
+            .unwrap_or_else(|| {
+                eprintln!("[community] WARNING: using own pubkey as primary — push events will be rejected");
+                pubkey.clone()
+            })
     };
 
     let community_state = std::sync::Arc::new(community::CommunityState {
