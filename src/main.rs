@@ -12,6 +12,7 @@ mod db;
 mod event;
 mod ingest;
 mod model;
+mod query;
 mod signing;
 mod sync;
 mod verify;

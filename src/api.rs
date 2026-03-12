@@ -23,7 +23,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{db, event, ingest, model, signing, sync, verify};
+use crate::{db, event, ingest, model, query, signing, sync, verify};
 
 // ── AppState ────────────────────────────────────────────────────────────────
 
@@ -80,6 +80,12 @@ impl From<db::DbError> for ApiError {
     }
 }
 
+impl From<rusqlite::Error> for ApiError {
+    fn from(e: rusqlite::Error) -> Self {
+        Self::from(db::DbError::from(e))
+    }
+}
+
 // ── Router ────────────────────────────────────────────────────────────────────
 
 /// Builds the full read-write router used by the primary node.
@@ -94,6 +100,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/admin/artists/merge", post(handle_admin_merge_artists))
         .route("/admin/artists/alias", post(handle_admin_add_alias))
         .route("/health",              get(|| async { "ok" }))
+        .merge(query::query_routes())
         .with_state(state)
 }
 
@@ -102,6 +109,7 @@ pub fn build_readonly_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/sync/events", get(handle_sync_events))
         .route("/health",      get(|| async { "ok" }))
+        .merge(query::query_routes())
         .with_state(state)
 }
 
@@ -164,8 +172,12 @@ async fn handle_ingest_feed(
 
         let feed_artist = db::resolve_artist(&conn, &artist_name)?;
 
-        // 5. Create artist credit for the feed artist
-        let feed_artist_credit = db::create_single_artist_credit(&conn, &feed_artist)?;
+        // 5. Get or create artist credit for the feed artist (idempotent)
+        let feed_artist_credit = db::get_or_create_artist_credit(
+            &conn,
+            &feed_artist.name,
+            &[(feed_artist.artist_id.clone(), feed_artist.name.clone(), String::new())],
+        )?;
 
         // 6. Get current time
         let now = std::time::SystemTime::now()
@@ -236,7 +248,11 @@ async fn handle_ingest_feed(
             // Per-track artist resolution
             let (track_credit_id, track_credit) = if let Some(author) = &track_data.author_name {
                 let track_artist = db::resolve_artist(&conn, author)?;
-                let credit = db::create_single_artist_credit(&conn, &track_artist)?;
+                let credit = db::get_or_create_artist_credit(
+                    &conn,
+                    &track_artist.name,
+                    &[(track_artist.artist_id.clone(), track_artist.name.clone(), String::new())],
+                )?;
                 (credit.id, credit)
             } else {
                 (feed_artist_credit.id, feed_artist_credit.clone())

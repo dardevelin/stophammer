@@ -376,6 +376,7 @@ pub fn create_artist_credit(
 }
 
 /// Creates a simple single-artist credit and returns it.
+#[expect(dead_code, reason = "convenience wrapper kept for future single-artist credit creation")]
 pub fn create_single_artist_credit(
     conn: &Connection,
     artist: &Artist,
@@ -388,7 +389,7 @@ pub fn create_single_artist_credit(
 }
 
 /// Retrieves an artist credit by ID, including its constituent names.
-#[expect(dead_code, reason = "used by query API in Sprint 2")]
+#[expect(dead_code, reason = "used by query API tests and future enrichment")]
 pub fn get_artist_credit(conn: &Connection, credit_id: i64) -> Result<Option<ArtistCredit>, DbError> {
     let credit: Option<(i64, String, i64)> = conn.query_row(
         "SELECT id, display_name, created_at FROM artist_credit WHERE id = ?1",
@@ -416,6 +417,95 @@ pub fn get_artist_credit(conn: &Connection, credit_id: i64) -> Result<Option<Art
     })?.collect::<Result<_, _>>()?;
 
     Ok(Some(ArtistCredit { id, display_name, created_at, names }))
+}
+
+/// Looks up an artist credit by display name (case-insensitive via `LOWER()`).
+pub fn get_artist_credit_by_display_name(
+    conn: &Connection,
+    display_name: &str,
+) -> Result<Option<ArtistCredit>, DbError> {
+    let lower = display_name.to_lowercase();
+
+    let credit: Option<(i64, String, i64)> = conn.query_row(
+        "SELECT id, display_name, created_at FROM artist_credit WHERE LOWER(display_name) = ?1",
+        params![lower],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).optional()?;
+
+    let Some((id, display_name, created_at)) = credit else {
+        return Ok(None);
+    };
+
+    let mut stmt = conn.prepare(
+        "SELECT id, artist_credit_id, artist_id, position, name, join_phrase \
+         FROM artist_credit_name WHERE artist_credit_id = ?1 ORDER BY position",
+    )?;
+    let names: Vec<ArtistCreditName> = stmt.query_map(params![id], |row| {
+        Ok(ArtistCreditName {
+            id:               row.get(0)?,
+            artist_credit_id: row.get(1)?,
+            artist_id:        row.get(2)?,
+            position:         row.get(3)?,
+            name:             row.get(4)?,
+            join_phrase:      row.get(5)?,
+        })
+    })?.collect::<Result<_, _>>()?;
+
+    Ok(Some(ArtistCredit { id, display_name, created_at, names }))
+}
+
+/// Idempotent artist credit retrieval: returns an existing credit if one with
+/// a matching `display_name` (case-insensitive) already exists, otherwise
+/// creates a new credit with the given `names`.
+pub fn get_or_create_artist_credit(
+    conn: &Connection,
+    display_name: &str,
+    names: &[(String, String, String)],  // (artist_id, credited_name, join_phrase)
+) -> Result<ArtistCredit, DbError> {
+    if let Some(existing) = get_artist_credit_by_display_name(conn, display_name)? {
+        return Ok(existing);
+    }
+    create_artist_credit(conn, display_name, names)
+}
+
+/// Returns all artist credits in which `artist_id` participates (via
+/// `artist_credit_name` JOIN).
+pub fn get_artist_credits_for_artist(
+    conn: &Connection,
+    artist_id: &str,
+) -> Result<Vec<ArtistCredit>, DbError> {
+    let mut credit_stmt = conn.prepare(
+        "SELECT DISTINCT ac.id, ac.display_name, ac.created_at \
+         FROM artist_credit ac \
+         JOIN artist_credit_name acn ON acn.artist_credit_id = ac.id \
+         WHERE acn.artist_id = ?1 \
+         ORDER BY ac.id",
+    )?;
+    let credits: Vec<(i64, String, i64)> = credit_stmt.query_map(params![artist_id], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+    })?.collect::<Result<_, _>>()?;
+
+    let mut name_stmt = conn.prepare(
+        "SELECT id, artist_credit_id, artist_id, position, name, join_phrase \
+         FROM artist_credit_name WHERE artist_credit_id = ?1 ORDER BY position",
+    )?;
+
+    let mut result = Vec::with_capacity(credits.len());
+    for (id, display_name, created_at) in credits {
+        let names: Vec<ArtistCreditName> = name_stmt.query_map(params![id], |row| {
+            Ok(ArtistCreditName {
+                id:               row.get(0)?,
+                artist_credit_id: row.get(1)?,
+                artist_id:        row.get(2)?,
+                position:         row.get(3)?,
+                name:             row.get(4)?,
+                join_phrase:      row.get(5)?,
+            })
+        })?.collect::<Result<_, _>>()?;
+        result.push(ArtistCredit { id, display_name, created_at, names });
+    }
+
+    Ok(result)
 }
 
 // ── upsert_feed ───────────────────────────────────────────────────────────────
