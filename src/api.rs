@@ -2388,6 +2388,7 @@ async fn handle_proofs_assert(
     let challenge_id = req.challenge_id.clone();
     let feed_guid2 = feed_guid.clone();
     let scope2 = scope.clone();
+    let phase1_feed_url = feed_url;
 
     let result = tokio::task::spawn_blocking(move || -> Result<ProofsAssertResponse, ApiError> {
         // Mutex safety compliant — 2026-03-12
@@ -2403,6 +2404,26 @@ async fn handle_proofs_assert(
             return Err(ApiError {
                 status:  StatusCode::BAD_REQUEST,
                 message: "token_binding not found in RSS podcast:txt".into(),
+                www_authenticate: None,
+            });
+        }
+
+        // Issue-PROOF-RACE — 2026-03-14
+        // Re-read the feed URL and reject if it changed since phase 1.
+        // A concurrent PATCH could have changed the URL between phase 1
+        // (which read it) and now, meaning the RSS verification in phase 2
+        // was performed against a URL that is no longer current.
+        let current_feed = db::get_feed_by_guid(&conn, &feed_guid2)
+            .map_err(ApiError::from)?
+            .ok_or_else(|| ApiError {
+                status:  StatusCode::NOT_FOUND,
+                message: "feed not found in database".into(),
+                www_authenticate: None,
+            })?;
+        if current_feed.feed_url != phase1_feed_url {
+            return Err(ApiError {
+                status:  StatusCode::CONFLICT,
+                message: "feed URL changed during verification; retry".into(),
                 www_authenticate: None,
             });
         }

@@ -259,6 +259,17 @@ of the general flow, and may require a separate project entirely.
   binding, challenge expiry (24h), and access token expiry (1h).
 - **SSRF validation**: `validate_feed_url` rejects private/reserved IPs and non-HTTP
   schemes before any RSS fetch.
+- **Assertion race detection**: The `POST /proofs/assert` handler has a three-phase
+  structure: phase 1 reads the `feed_url` under the DB lock, phase 2 performs async RSS
+  verification against that URL, and phase 3 re-acquires the lock to issue the token. A
+  concurrent `PATCH /feeds/{guid}` could change the `feed_url` between phases 1 and 3,
+  meaning the RSS verification was performed against a URL that is no longer current.
+  Phase 3 now re-reads the feed and compares the current `feed_url` to the one used in
+  phase 2. If they differ, the handler returns HTTP 409 (Conflict) with the message
+  "feed URL changed during verification; retry" and does not issue a token. This follows
+  RFC 9110 Section 15.5.10 (409 Conflict): the request could not be completed due to a
+  conflict with the current state of the target resource. The client should re-start the
+  challenge/assert flow from `POST /proofs/challenge`.
 
 ### Phase 2 (not implemented)
 

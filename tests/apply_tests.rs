@@ -1107,3 +1107,71 @@ fn out_of_order_event_is_rejected() {
     };
     assert_eq!(title, "Title Seq 10", "feed data must reflect seq=10 event only");
 }
+
+// ---------------------------------------------------------------------------
+// 14. Issue-CURSOR-MONOTONIC: cursor does not regress when old event applied
+// ---------------------------------------------------------------------------
+
+/// If `node_sync_state.last_seq` is already 15 and we call
+/// `upsert_node_sync_state` with seq=10, the stored cursor must remain 15.
+// Issue-CURSOR-MONOTONIC — 2026-03-14
+#[test]
+fn cursor_does_not_regress_when_old_event_applied() {
+    let conn = common::test_db();
+    let now = common::now();
+
+    // Seed cursor at seq=15.
+    stophammer::db::upsert_node_sync_state(&conn, "peer-mono-1", 15, now)
+        .expect("seed cursor at 15");
+
+    // Attempt to regress to seq=10.
+    stophammer::db::upsert_node_sync_state(&conn, "peer-mono-1", 10, now + 1)
+        .expect("upsert with lower seq");
+
+    let stored: i64 = conn
+        .query_row(
+            "SELECT last_seq FROM node_sync_state WHERE node_pubkey = 'peer-mono-1'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("query last_seq");
+
+    assert_eq!(
+        stored, 15,
+        "cursor must NOT regress from 15 to 10 — monotonic invariant violated"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 15. Issue-CURSOR-MONOTONIC: cursor advances when new event applied
+// ---------------------------------------------------------------------------
+
+/// If `node_sync_state.last_seq` is 5 and we call `upsert_node_sync_state`
+/// with seq=10, the stored cursor must advance to 10.
+// Issue-CURSOR-MONOTONIC — 2026-03-14
+#[test]
+fn cursor_advances_when_new_event_applied() {
+    let conn = common::test_db();
+    let now = common::now();
+
+    // Seed cursor at seq=5.
+    stophammer::db::upsert_node_sync_state(&conn, "peer-mono-2", 5, now)
+        .expect("seed cursor at 5");
+
+    // Advance to seq=10.
+    stophammer::db::upsert_node_sync_state(&conn, "peer-mono-2", 10, now + 1)
+        .expect("upsert with higher seq");
+
+    let stored: i64 = conn
+        .query_row(
+            "SELECT last_seq FROM node_sync_state WHERE node_pubkey = 'peer-mono-2'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("query last_seq");
+
+    assert_eq!(
+        stored, 10,
+        "cursor must advance from 5 to 10"
+    );
+}

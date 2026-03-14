@@ -311,6 +311,10 @@ async fn serve_with_optional_tls(router: axum::Router, bind_addr: &str) {
         let acme_account_path = std::env::var("TLS_ACME_ACCOUNT_PATH")
             .unwrap_or_else(|_| "./tls/acme-account.json".into());
 
+        let acme_directory_url = std::env::var("TLS_ACME_DIRECTORY_URL")
+            .ok()
+            .filter(|s| !s.is_empty());
+
         let config = tls::TlsConfig {
             domain: tls_domain,
             acme_email,
@@ -318,6 +322,7 @@ async fn serve_with_optional_tls(router: axum::Router, bind_addr: &str) {
             key_path: key_path.clone().into(),
             acme_account_path: acme_account_path.into(),
             staging,
+            acme_directory_url,
         };
 
         if tls::cert_needs_renewal(&config.cert_path) {

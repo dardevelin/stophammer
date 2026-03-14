@@ -139,6 +139,7 @@ The binary gains two new environment variables:
 | `TLS_CERT_PATH` | `./tls/cert.pem` | Path to store the provisioned certificate chain. |
 | `TLS_KEY_PATH` | `./tls/key.pem` | Path to store the certificate private key. |
 | `TLS_ACME_STAGING` | `false` | Use Let's Encrypt staging environment (for testing). |
+| `TLS_ACME_DIRECTORY_URL` | unset | Custom ACME directory URL. Overrides `TLS_ACME_STAGING` when set. For Pebble testing: `https://pebble:14000/dir`. |
 
 On startup, when `TLS_DOMAIN` is set:
 1. Check if a valid certificate exists at `TLS_CERT_PATH` with > 30 days remaining.
@@ -214,3 +215,6 @@ HTTPS for any plain HTTP request after provisioning.
 - Certificate private keys are stored on disk at `TLS_KEY_PATH`. Operators are
   responsible for filesystem permissions (the binary sets 0o600 on write, matching the
   signing key convention from ADR 0004).
+- `TLS_ACME_DIRECTORY_URL` enables testing with non-LE ACME servers such as Pebble
+  (`ghcr.io/letsencrypt/pebble`). When set, it overrides `TLS_ACME_STAGING` entirely.
+  See `docker-compose.e2e-tls.yml` for a ready-to-run Pebble test environment.

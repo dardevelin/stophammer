@@ -353,18 +353,18 @@ fn search_index_population() {
     // Issue-FTS5-CONTENT — 2026-03-14
     // Verify that search::search() returns correct entity_type and entity_id
     // by joining through search_entities (not reading contentless FTS5 columns).
-    let results = stophammer::search::search(&conn, "electronic", None, 10, 0).unwrap();
+    let results = stophammer::search::search(&conn, "electronic", None, 10, None, None).unwrap();
     assert_eq!(results.len(), 1, "only one entity has 'electronic'");
     assert_eq!(results[0].entity_type, "feed");
     assert_eq!(results[0].entity_id, "feed-fts");
 
-    let results = stophammer::search::search(&conn, "rock", None, 10, 0).unwrap();
+    let results = stophammer::search::search(&conn, "rock", None, 10, None, None).unwrap();
     assert_eq!(results.len(), 1, "only one entity has 'rock'");
     assert_eq!(results[0].entity_type, "track");
     assert_eq!(results[0].entity_id, "track-fts");
 
     // Filtered search: only feeds
-    let results = stophammer::search::search(&conn, "FTS Artist", Some("feed"), 10, 0).unwrap();
+    let results = stophammer::search::search(&conn, "FTS Artist", Some("feed"), 10, None, None).unwrap();
     assert_eq!(results.len(), 1, "only the feed should match when filtered to 'feed'");
     assert_eq!(results[0].entity_type, "feed");
     assert_eq!(results[0].entity_id, "feed-fts");

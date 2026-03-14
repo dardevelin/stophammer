@@ -205,10 +205,12 @@ fn community_state_has_debug() {
 #[test]
 fn search_result_has_debug() {
     let result = stophammer::search::SearchResult {
-        entity_type:   "track".into(),
-        entity_id:     "t1".into(),
-        rank:          1.0,
-        quality_score: 50,
+        entity_type:    "track".into(),
+        entity_id:      "t1".into(),
+        rank:           1.0,
+        quality_score:  50,
+        effective_rank: 1.0,
+        rowid:          42,
     };
     let _ = format!("{result:?}");
 }

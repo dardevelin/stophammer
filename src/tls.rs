@@ -35,6 +35,29 @@ pub struct TlsConfig {
     pub key_path: std::path::PathBuf,
     pub acme_account_path: std::path::PathBuf,
     pub staging: bool,
+    /// Custom ACME directory URL (e.g. Pebble at `https://pebble:14000/dir`).
+    /// When set, overrides the `staging` toggle entirely.
+    pub acme_directory_url: Option<String>,
+}
+
+impl TlsConfig {
+    /// Resolve the ACME directory URL for this configuration.
+    ///
+    /// Returns the custom URL when `acme_directory_url` is set, otherwise
+    /// falls back to the Let's Encrypt production or staging URL based on
+    /// the `staging` flag.
+    #[must_use]
+    pub fn resolved_directory_url(&self) -> &str {
+        self.acme_directory_url
+            .as_deref()
+            .unwrap_or_else(|| {
+                if self.staging {
+                    LetsEncrypt::Staging.url()
+                } else {
+                    LetsEncrypt::Production.url()
+                }
+            })
+    }
 }
 
 /// Returns `true` if the certificate at `cert_path` is missing or expires within
@@ -75,11 +98,8 @@ pub fn cert_needs_renewal(cert_path: impl AsRef<std::path::Path>) -> bool {
 pub async fn provision_certificate(
     config: &TlsConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let directory_url = if config.staging {
-        LetsEncrypt::Staging.url()
-    } else {
-        LetsEncrypt::Production.url()
-    };
+    // Issue-PEBBLE-ACME — 2026-03-14
+    let directory_url = config.resolved_directory_url();
 
     let contact = format!("mailto:{}", config.acme_email);
     let account = if std::path::Path::new(&config.acme_account_path).exists() {

@@ -130,6 +130,28 @@ This structure is required because `bm25()` is an FTS5 auxiliary function that
 is only valid when the FTS5 table is the primary table in a MATCH query. Moving
 the JOIN into the inner query would prevent `bm25()` from functioning.
 
+### Keyset pagination
+
+Search results are paginated using keyset cursors rather than OFFSET. The
+cursor encodes the last result's `(effective_rank, rowid)` pair as a
+base64-encoded string following the same `base64(value1 \0 value2)` format
+used by the other paginated endpoints (`/v1/artists/{id}/feeds`, `/v1/recent`).
+
+The `effective_rank` is a quality-adjusted BM25 score:
+`bm25(search_index) * (1.0 + quality_score / 100.0)`. Lower (more negative)
+values indicate better matches. The `rowid` (SipHash-2-4 of entity type + id)
+serves as a deterministic tiebreaker for results with identical effective rank.
+
+Because `effective_rank` is a floating-point value, the cursor encodes it
+losslessly via `f64::to_bits()` / `f64::from_bits()` as a `u64` decimal
+string. The handler rejects cursors containing `NaN` or infinity. The keyset
+WHERE clause filters to `(effective_rank > cursor_rank) OR
+(effective_rank = cursor_rank AND rowid > cursor_rowid)`, matching the
+`ORDER BY effective_rank ASC, rowid ASC` sort.
+
+The response uses the same `pagination: { cursor, has_more }` envelope as
+all other paginated query endpoints.
+
 ## Consequences
 
 - Search results now correctly return `entity_type` and `entity_id` from the

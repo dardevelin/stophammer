@@ -1,0 +1,137 @@
+name: stophammer-e2e
+
+# End-to-end test environment for stophammer.
+#
+# Topology:
+#   primary     — port 8008. Primary node (plain HTTP, test mode).
+#   community1  — port 8009. Community node replicating from primary.
+#   community2  — port 8010. Second community node (multi-node replication).
+#   mock-rss    — port 8088. Static nginx serving test RSS feeds.
+#
+# Usage:
+#   docker compose -f docker-compose.e2e.yml up -d --build --wait
+#   ./tests/e2e_docker_compose_tests.sh
+#   docker compose -f docker-compose.e2e.yml down -v
+
+services:
+
+  # ── Primary ──────────────────────────────────────────────────────────────────
+
+  primary:
+    build:
+      context: .
+    environment:
+      NODE_MODE:       primary
+      CRAWL_TOKEN:     test-token
+      ADMIN_TOKEN:     test-admin-token
+      SYNC_TOKEN:      test-sync-token
+      DB_PATH:         /data/stophammer.db
+      KEY_PATH:        /data/signing.key
+      BIND:            0.0.0.0:8008
+      VERIFIER_CHAIN:  crawl_token,content_hash
+      TZ:              UTC
+    volumes:
+      - primary-e2e:/data
+    ports:
+      - "8008:8008"
+    networks:
+      - e2e
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8008/health"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+
+  # ── Community node 1 ─────────────────────────────────────────────────────────
+
+  community1:
+    build:
+      context: .
+    environment:
+      NODE_MODE:                        community
+      DB_PATH:                          /data/stophammer.db
+      KEY_PATH:                         /data/signing.key
+      BIND:                             0.0.0.0:8008
+      PRIMARY_URL:                      http://primary:8008
+      NODE_ADDRESS:                     http://community1:8008
+      TRACKER_URL:                      http://primary:8008
+      ALLOW_INSECURE_PUBKEY_DISCOVERY:  "true"
+      POLL_INTERVAL_SECS:               5
+      PUSH_TIMEOUT_SECS:                10
+      TZ:                               UTC
+    volumes:
+      - community1-e2e:/data
+    ports:
+      - "8009:8008"
+    networks:
+      - e2e
+    depends_on:
+      primary:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8008/health"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+
+  # ── Community node 2 ─────────────────────────────────────────────────────────
+
+  community2:
+    build:
+      context: .
+    environment:
+      NODE_MODE:                        community
+      DB_PATH:                          /data/stophammer.db
+      KEY_PATH:                         /data/signing.key
+      BIND:                             0.0.0.0:8008
+      PRIMARY_URL:                      http://primary:8008
+      NODE_ADDRESS:                     http://community2:8008
+      TRACKER_URL:                      http://primary:8008
+      ALLOW_INSECURE_PUBKEY_DISCOVERY:  "true"
+      POLL_INTERVAL_SECS:               5
+      PUSH_TIMEOUT_SECS:                10
+      TZ:                               UTC
+    volumes:
+      - community2-e2e:/data
+    ports:
+      - "8010:8008"
+    networks:
+      - e2e
+    depends_on:
+      primary:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8008/health"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+
+  # ── Mock RSS server ──────────────────────────────────────────────────────────
+  # Serves static test RSS feeds and podcast:txt proof files.
+
+  mock-rss:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./tests/fixtures/mock-rss:/usr/share/nginx/html:ro
+    ports:
+      - "8088:80"
+    networks:
+      - e2e
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:80/"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+      start_period: 2s
+
+volumes:
+  primary-e2e:
+  community1-e2e:
+  community2-e2e:
+
+networks:
+  e2e:
+    driver: bridge

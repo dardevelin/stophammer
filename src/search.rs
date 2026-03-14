@@ -37,10 +37,16 @@ fn truncate_fts_field(s: &str) -> Cow<'_, str> {
 // CRIT-03 Debug derive — 2026-03-13
 #[derive(Debug)]
 pub struct SearchResult {
-    pub entity_type:   String,
-    pub entity_id:     String,
-    pub rank:          f64,
-    pub quality_score: i64,
+    pub entity_type:     String,
+    pub entity_id:       String,
+    pub rank:            f64,
+    pub quality_score:   i64,
+    /// Quality-adjusted rank used as the primary sort key for keyset pagination.
+    // Issue-SEARCH-KEYSET — 2026-03-14
+    pub effective_rank:  f64,
+    /// FTS5 rowid, used as tiebreaker in keyset pagination cursors.
+    // Issue-SEARCH-KEYSET — 2026-03-14
+    pub rowid:           i64,
 }
 
 // SP-01 stable FTS5 hash — 2026-03-13
@@ -199,7 +205,12 @@ pub fn sanitize_fts5_query(input: &str) -> String {
 /// weighted by an optional quality score from `entity_quality`.
 ///
 /// `entity_type_filter` — if `Some`, restricts results to that entity type.
-/// `limit` and `offset` provide pagination.
+/// `limit` controls the maximum number of results returned.
+///
+/// Pagination uses keyset cursors: if `cursor_rank` and `cursor_rowid` are
+/// provided, only results after the given `(effective_rank, rowid)` position
+/// are returned. The effective rank is the quality-adjusted BM25 score used
+/// as the primary ORDER BY key; `rowid` is the tiebreaker.
 ///
 /// The query is sanitized via [`sanitize_fts5_query`] before being passed to
 /// FTS5. If the sanitized query is empty, an empty result set is returned
@@ -208,13 +219,14 @@ pub fn sanitize_fts5_query(input: &str) -> String {
 /// # Errors
 ///
 /// Returns [`DbError`] if the FTS5 MATCH query fails.
-// Issue-FTS5-CONTENT — 2026-03-14
+// Issue-SEARCH-KEYSET — 2026-03-14
 pub fn search(
     conn: &Connection,
     query: &str,
     entity_type_filter: Option<&str>,
     limit: i64,
-    offset: i64,
+    cursor_rank: Option<f64>,
+    cursor_rowid: Option<i64>,
 ) -> Result<Vec<SearchResult>, DbError> {
     // Issue-21 FTS5 sanitize — 2026-03-13
     let safe_query = sanitize_fts5_query(query);
@@ -222,51 +234,111 @@ pub fn search(
         return Ok(Vec::new());
     }
 
-    // Issue-FTS5-CONTENT — 2026-03-14
+    // Issue-SEARCH-KEYSET — 2026-03-14
     // The FTS5 table is contentless (content=''), so column values cannot be
     // read back.  We use a subquery to obtain rowid + bm25() rank from FTS5
     // (the bm25() function is only valid in queries where FTS5 is the primary
     // table with a MATCH clause), then JOIN the companion `search_entities`
     // table in the outer query to resolve (entity_type, entity_id).
-    let sql = if entity_type_filter.is_some() {
-        "SELECT e.entity_type, e.entity_id, m.fts_rank, \
-                COALESCE(q.score, 0) AS quality_score \
-         FROM (SELECT rowid, bm25(search_index) AS fts_rank \
-               FROM search_index WHERE search_index MATCH ?1) m \
-         JOIN search_entities e ON e.rowid = m.rowid \
-         LEFT JOIN entity_quality q \
-           ON q.entity_type = e.entity_type AND q.entity_id = e.entity_id \
-         WHERE e.entity_type = ?2 \
-         ORDER BY (m.fts_rank * (1.0 + CAST(COALESCE(q.score, 0) AS REAL) / 100.0)) \
-         LIMIT ?3 OFFSET ?4"
-    } else {
-        "SELECT e.entity_type, e.entity_id, m.fts_rank, \
-                COALESCE(q.score, 0) AS quality_score \
-         FROM (SELECT rowid, bm25(search_index) AS fts_rank \
-               FROM search_index WHERE search_index MATCH ?1) m \
-         JOIN search_entities e ON e.rowid = m.rowid \
-         LEFT JOIN entity_quality q \
-           ON q.entity_type = e.entity_type AND q.entity_id = e.entity_id \
-         ORDER BY (m.fts_rank * (1.0 + CAST(COALESCE(q.score, 0) AS REAL) / 100.0)) \
-         LIMIT ?3 OFFSET ?4"
-    };
+    //
+    // Keyset pagination: when a cursor is present, the outer WHERE filters
+    // to rows strictly after the cursor position in sort order. The sort key
+    // is (effective_rank ASC, rowid ASC) where effective_rank is the quality-
+    // adjusted BM25 score (lower = better match). BM25 scores are negative,
+    // so "next page" means effective_rank > cursor_rank (less negative =
+    // worse match), with rowid as the tiebreaker for identical ranks.
+    //
+    // The effective_rank expression must be repeated in the WHERE clause
+    // because SQL does not allow referencing SELECT aliases in WHERE.
+    let has_cursor = cursor_rank.is_some() && cursor_rowid.is_some();
+    let has_type_filter = entity_type_filter.is_some();
 
-    let filter = entity_type_filter.unwrap_or("");
-    let mut stmt = conn.prepare(sql)?;
+    // Positional parameters: ?1 = MATCH query
+    // When cursor is present: ?2 = cursor_rank, ?3 = cursor_rowid
+    // Type filter and limit params shift accordingly.
+    let eff_rank_expr =
+        "(m.fts_rank * (1.0 + CAST(COALESCE(q.score, 0) AS REAL) / 100.0))";
 
-    let rows = stmt.query_map(params![safe_query, filter, limit, offset], |row| {
-        Ok(SearchResult {
-            entity_type:   row.get(0)?,
-            entity_id:     row.get(1)?,
-            rank:          row.get(2)?,
-            quality_score: row.get(3)?,
-        })
-    })?;
+    let mut where_parts = Vec::new();
+    let mut next_param: u8 = 2;
 
-    let mut results = Vec::new();
-    for row in rows {
-        results.push(row?);
+    if has_cursor {
+        where_parts.push(format!(
+            "({eff_rank_expr} > ?{p1} OR ({eff_rank_expr} = ?{p1} AND m.rowid > ?{p2}))",
+            p1 = next_param,
+            p2 = next_param + 1,
+        ));
+        next_param += 2;
     }
 
-    Ok(results)
+    let type_param_idx = next_param;
+    if has_type_filter {
+        where_parts.push(format!("e.entity_type = ?{type_param_idx}"));
+        next_param += 1;
+    }
+
+    let limit_param_idx = next_param;
+
+    let where_clause = if where_parts.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {} ", where_parts.join(" AND "))
+    };
+
+    let sql = format!(
+        "SELECT e.entity_type, e.entity_id, m.fts_rank, \
+                COALESCE(q.score, 0) AS quality_score, \
+                {eff_rank_expr} AS eff_rank, \
+                m.rowid \
+         FROM (SELECT rowid, bm25(search_index) AS fts_rank \
+               FROM search_index WHERE search_index MATCH ?1) m \
+         JOIN search_entities e ON e.rowid = m.rowid \
+         LEFT JOIN entity_quality q \
+           ON q.entity_type = e.entity_type AND q.entity_id = e.entity_id \
+         {where_clause}\
+         ORDER BY eff_rank ASC, m.rowid ASC \
+         LIMIT ?{limit_param_idx}"
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+
+    let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<SearchResult> {
+        Ok(SearchResult {
+            entity_type:    row.get(0)?,
+            entity_id:      row.get(1)?,
+            rank:           row.get(2)?,
+            quality_score:  row.get(3)?,
+            effective_rank: row.get(4)?,
+            rowid:          row.get(5)?,
+        })
+    };
+
+    // Issue-SEARCH-KEYSET — 2026-03-14
+    // Build parameter list dynamically based on which optional clauses are
+    // active.  SQLite positional params (?N) are 1-based.
+    let filter = entity_type_filter.unwrap_or("");
+    let rows: Vec<SearchResult> = match (has_cursor, has_type_filter) {
+        (true, true) => {
+            let cr = cursor_rank.unwrap_or(0.0);
+            let crid = cursor_rowid.unwrap_or(0);
+            stmt.query_map(params![safe_query, cr, crid, filter, limit], map_row)?
+                .collect::<Result<Vec<_>, _>>()?
+        }
+        (true, false) => {
+            let cr = cursor_rank.unwrap_or(0.0);
+            let crid = cursor_rowid.unwrap_or(0);
+            stmt.query_map(params![safe_query, cr, crid, limit], map_row)?
+                .collect::<Result<Vec<_>, _>>()?
+        }
+        (false, true) => {
+            stmt.query_map(params![safe_query, filter, limit], map_row)?
+                .collect::<Result<Vec<_>, _>>()?
+        }
+        (false, false) => {
+            stmt.query_map(params![safe_query, limit], map_row)?
+                .collect::<Result<Vec<_>, _>>()?
+        }
+    };
+
+    Ok(rows)
 }

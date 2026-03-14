@@ -25,7 +25,7 @@ A new `src/community.rs` module owns the sync logic. `src/main.rs` branches on `
 ### `CommunityConfig`
 All community-specific parameters are grouped in `CommunityConfig`:
 - `primary_url` — base URL of the primary node
-- `tracker_url` — base URL of the Cloudflare tracker (default: `https://stophammer-tracker.workers.dev`)
+- `tracker_url` — base URL of the Cloudflare tracker (default: `https://stophammer-tracker.workers.dev`). Optional — set to an empty string or a local URL to remove the external dependency. Tracker registration is best-effort and not required for sync
 - `node_address` — this node's public address registered with the tracker
 - `poll_interval_secs` — seconds between polls (default: 30)
 

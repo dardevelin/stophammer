@@ -27,7 +27,9 @@ actually music.
 Stophammer is a **verified V4V music index**. It only contains RSS feeds that:
 
 - declare `podcast:medium=music`
-- carry at least one working `podcast:value` payment route
+- carry at least one structurally valid `podcast:value` payment route
+  (non-empty address with a positive split — the verifier checks metadata
+  presence, not Lightning node reachability or payment delivery)
 
 Every entry has been crawled and passed through a verifier chain. The index is an
 **append-only signed event log** — you can verify the integrity of every feed
@@ -88,7 +90,7 @@ crawl_token → content_hash → medium_music → feed_guid → v4v_payment → 
 | `content_hash` | Short-circuits unchanged feeds (no DB write, no event) |
 | `medium_music` | Rejects feeds without `podcast:medium=music` |
 | `feed_guid` | Rejects malformed or known-bad `podcast:guid` values |
-| `v4v_payment` | Rejects feeds with no valid V4V payment routes |
+| `v4v_payment` | Rejects feeds with no structurally valid V4V payment routes (requires non-empty address + positive split; does not test reachability) |
 | `enclosure_type` | Warns on video MIME type enclosures |
 
 Override at runtime with `VERIFIER_CHAIN=crawl_token,content_hash,...`.

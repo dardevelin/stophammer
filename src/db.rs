@@ -1680,9 +1680,14 @@ pub fn get_event_refs_since(
 
 /// Records or updates the last-seen sequence number for a peer node.
 ///
+/// The cursor is monotonic: the stored `last_seq` can only increase.
+/// `MAX(last_seq, excluded.last_seq)` prevents regression when events
+/// are applied out of order (e.g. seq=15 then seq=10).
+///
 /// # Errors
 ///
 /// Returns [`DbError`] if the SQL upsert fails.
+// Issue-CURSOR-MONOTONIC — 2026-03-14
 pub fn upsert_node_sync_state(
     conn:         &Connection,
     node_pubkey:  &str,
@@ -1693,7 +1698,7 @@ pub fn upsert_node_sync_state(
         "INSERT INTO node_sync_state (node_pubkey, last_seq, last_seen_at) \
          VALUES (?1, ?2, ?3) \
          ON CONFLICT(node_pubkey) DO UPDATE SET \
-           last_seq     = excluded.last_seq, \
+           last_seq     = MAX(last_seq, excluded.last_seq), \
            last_seen_at = excluded.last_seen_at",
         params![node_pubkey, last_seq, last_seen_at],
     )?;

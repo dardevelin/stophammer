@@ -86,10 +86,40 @@ fn provision_certificate_future_is_send() {
         key_path: "/tmp/key.pem".into(),
         acme_account_path: "/tmp/acme.json".into(),
         staging: true,
+        acme_directory_url: None,
     };
     let fut = tls::provision_certificate(&config);
     assert_send(&fut);
     drop(fut);
+}
+
+/// When `TLS_ACME_DIRECTORY_URL` is set, the resolved directory URL must
+/// return the custom value instead of a Let's Encrypt production or staging URL.
+#[test]
+fn tls_acme_directory_url_env_var_is_read() {
+    let custom_url = "https://example.com/acme/dir";
+    let config = tls::TlsConfig {
+        domain: "test.local".into(),
+        acme_email: "test@test.local".into(),
+        cert_path: "/tmp/cert.pem".into(),
+        key_path: "/tmp/key.pem".into(),
+        acme_account_path: "/tmp/acme.json".into(),
+        staging: false,
+        acme_directory_url: Some(custom_url.to_string()),
+    };
+
+    let resolved = config.resolved_directory_url();
+    assert_eq!(resolved, custom_url, "custom directory URL should override production/staging");
+    assert_ne!(
+        resolved,
+        instant_acme::LetsEncrypt::Production.url(),
+        "must not resolve to LE production"
+    );
+    assert_ne!(
+        resolved,
+        instant_acme::LetsEncrypt::Staging.url(),
+        "must not resolve to LE staging"
+    );
 }
 
 /// `cert_needs_renewal` correctly parses certificates that use `GeneralizedTime`

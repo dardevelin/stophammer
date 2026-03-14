@@ -1004,6 +1004,7 @@ async fn handle_get_recent(
 
 // ── GET /v1/search ──────────────────────────────────────────────────────────
 
+// Issue-SEARCH-KEYSET — 2026-03-14
 async fn handle_search(
     State(state): State<Arc<api::AppState>>,
     Query(params): Query<SearchQuery>,
@@ -1011,16 +1012,48 @@ async fn handle_search(
     let q = params.q.clone();
     let kind = params.kind.clone();
     let limit = params.limit.unwrap_or(20).min(100);
-    let cursor_offset = params.cursor
-        .as_deref()
-        .and_then(|c| c.parse::<i64>().ok())
-        .unwrap_or(0);
+
+    // Issue-SEARCH-KEYSET — 2026-03-14
+    // Parse keyset cursor: base64(f64_bits_as_decimal \0 rowid_as_decimal).
+    // The f64 rank is encoded via `f64::to_bits()` for a lossless round-trip.
+    let (cursor_rank, cursor_rowid) = if let Some(ref cursor_str) = params.cursor {
+        let decoded = decode_cursor(cursor_str)?;
+        let parts: Vec<&str> = decoded.splitn(2, '\0').collect();
+        if parts.len() != 2 {
+            return Err(api::ApiError {
+                status:  StatusCode::BAD_REQUEST,
+                message: "invalid cursor format".into(),
+                www_authenticate: None,
+            });
+        }
+        let rank_bits: u64 = parts[0].parse().map_err(|_err| api::ApiError {
+            status:  StatusCode::BAD_REQUEST,
+            message: "invalid cursor rank".into(),
+            www_authenticate: None,
+        })?;
+        let rowid: i64 = parts[1].parse().map_err(|_err| api::ApiError {
+            status:  StatusCode::BAD_REQUEST,
+            message: "invalid cursor rowid".into(),
+            www_authenticate: None,
+        })?;
+        let rank = f64::from_bits(rank_bits);
+        if rank.is_nan() || rank.is_infinite() {
+            return Err(api::ApiError {
+                status:  StatusCode::BAD_REQUEST,
+                message: "invalid cursor rank: non-finite value".into(),
+                www_authenticate: None,
+            });
+        }
+        (Some(rank), Some(rowid))
+    } else {
+        (None, None)
+    };
 
     let db = Arc::clone(&state.db);
     // Mutex safety compliant — 2026-03-12
     let results = tokio::task::spawn_blocking(move || {
         let conn = db.lock().map_err(|_err| db::DbError::Poisoned)?;
-        crate::search::search(&conn, &q, kind.as_deref(), limit + 1, cursor_offset)
+        crate::search::search(&conn, &q, kind.as_deref(), limit + 1, cursor_rank, cursor_rowid)
     })
     .await
     .map_err(|e| api::ApiError {
@@ -1054,7 +1087,17 @@ async fn handle_search(
         }))
         .collect();
 
-    let next_cursor = has_more.then(|| (cursor_offset + limit).to_string());
+    // Issue-SEARCH-KEYSET — 2026-03-14
+    // Encode keyset cursor from the last result's (effective_rank, rowid).
+    let next_cursor = if has_more {
+        let limit_usize = usize::try_from(limit).unwrap_or(0);
+        results.get(limit_usize.saturating_sub(1)).map(|r| {
+            let rank_bits = r.effective_rank.to_bits();
+            encode_cursor(&format!("{}\0{}", rank_bits, r.rowid))
+        })
+    } else {
+        None
+    };
 
     Ok(Json(QueryResponse {
         data,

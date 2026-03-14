@@ -1,6 +1,7 @@
 mod common;
 
 use rusqlite::params;
+use stophammer::search;
 
 // ---------------------------------------------------------------------------
 // FTS5 contentless mode notes:
@@ -218,4 +219,87 @@ fn quality_score_stored() {
 
     assert_eq!(score, 85);
     assert_eq!(computed_at, now);
+}
+
+// ---------------------------------------------------------------------------
+// Issue-SEARCH-KEYSET — 2026-03-14
+// 7. keyset_pagination — insert 3 entities, limit=2, fetch page 1, use cursor
+//    for page 2, assert third result appears with no duplicates
+// ---------------------------------------------------------------------------
+
+#[test]
+fn keyset_pagination() {
+    let conn = common::test_db();
+
+    // Insert 3 entities that all match "podcast". Use populate_search_index
+    // so the companion search_entities table is maintained in lockstep.
+    search::populate_search_index(&conn, "feed", "f1", "podcast alpha", "", "", "").unwrap();
+    search::populate_search_index(&conn, "feed", "f2", "podcast beta", "", "", "").unwrap();
+    search::populate_search_index(&conn, "feed", "f3", "podcast gamma", "", "", "").unwrap();
+
+    // Page 1: limit=2+1 (fetch one extra to detect has_more)
+    let page1 = search::search(&conn, "podcast", None, 3, None, None).unwrap();
+    assert_eq!(page1.len(), 3, "all 3 results should be returned when limit=3");
+
+    // Now fetch with limit=2 (the real page size)
+    let page1 = search::search(&conn, "podcast", None, 2, None, None).unwrap();
+    assert_eq!(page1.len(), 2, "page 1 should return exactly 2 results");
+
+    // Build cursor from the last result of page 1
+    let last = &page1[1];
+    let cursor_rank = last.effective_rank;
+    let cursor_rowid = last.rowid;
+
+    // Page 2: pass cursor
+    let page2 = search::search(&conn, "podcast", None, 2, Some(cursor_rank), Some(cursor_rowid)).unwrap();
+    assert_eq!(page2.len(), 1, "page 2 should return the remaining 1 result");
+
+    // Verify no duplicates: collect all entity_ids from both pages
+    let mut all_ids: Vec<&str> = page1.iter().map(|r| r.entity_id.as_str()).collect();
+    all_ids.extend(page2.iter().map(|r| r.entity_id.as_str()));
+    all_ids.sort_unstable();
+    all_ids.dedup();
+    assert_eq!(all_ids.len(), 3, "all 3 unique entities should appear across both pages");
+}
+
+// ---------------------------------------------------------------------------
+// Issue-SEARCH-KEYSET — 2026-03-14
+// 8. keyset_cursor_stable_after_insert — fetch page 1, insert a new matching
+//    item, fetch page 2 with cursor — page 2 must not duplicate page-1 items
+// ---------------------------------------------------------------------------
+
+#[test]
+fn keyset_cursor_stable_after_insert() {
+    let conn = common::test_db();
+
+    // Start with 3 entities matching "music"
+    search::populate_search_index(&conn, "feed", "f1", "music alpha", "", "", "").unwrap();
+    search::populate_search_index(&conn, "feed", "f2", "music beta", "", "", "").unwrap();
+    search::populate_search_index(&conn, "feed", "f3", "music gamma", "", "", "").unwrap();
+
+    // Fetch page 1 with limit=2
+    let page1 = search::search(&conn, "music", None, 2, None, None).unwrap();
+    assert_eq!(page1.len(), 2, "page 1 should have 2 results");
+
+    let page1_ids: Vec<&str> = page1.iter().map(|r| r.entity_id.as_str()).collect();
+
+    // Simulate an insertion between page fetches
+    search::populate_search_index(&conn, "feed", "f4", "music delta", "", "", "").unwrap();
+
+    // Build cursor from last result of page 1
+    let last = &page1[1];
+    let cursor_rank = last.effective_rank;
+    let cursor_rowid = last.rowid;
+
+    // Fetch page 2 with the cursor from page 1
+    let page2 = search::search(&conn, "music", None, 10, Some(cursor_rank), Some(cursor_rowid)).unwrap();
+
+    // Page 2 must NOT contain any items that were already on page 1
+    for r in &page2 {
+        assert!(
+            !page1_ids.contains(&r.entity_id.as_str()),
+            "page 2 result '{}' was already on page 1 — keyset cursor should prevent duplicates",
+            r.entity_id,
+        );
+    }
 }

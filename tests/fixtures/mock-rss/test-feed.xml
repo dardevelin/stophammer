@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"
+     xmlns:podcast="https://podcastindex.org/namespace/1.0"
+     xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd">
+  <channel>
+    <title>E2E Test Album</title>
+    <link>http://mock-rss/test-feed.xml</link>
+    <description>A test music feed for end-to-end testing.</description>
+    <language>en</language>
+    <podcast:guid>e2e-test-guid-aaaa-bbbb-ccccddddeeee</podcast:guid>
+    <podcast:medium>music</podcast:medium>
+    <itunes:author>E2E Test Artist</itunes:author>
+    <itunes:explicit>false</itunes:explicit>
+    <itunes:image href="http://mock-rss/cover.jpg"/>
+    <podcast:value type="lightning" method="keysend">
+      <podcast:valueRecipient name="E2E Test Artist" type="node"
+        address="02e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2"
+        split="100"/>
+    </podcast:value>
+    <item>
+      <title>Test Track One</title>
+      <guid>e2e-track-one-guid</guid>
+      <pubDate>Sat, 01 Mar 2026 00:00:00 UTC</pubDate>
+      <itunes:duration>180</itunes:duration>
+      <itunes:explicit>false</itunes:explicit>
+      <enclosure url="http://mock-rss/track1.mp3" type="audio/mpeg" length="4500000"/>
+    </item>
+    <item>
+      <title>Test Track Two</title>
+      <guid>e2e-track-two-guid</guid>
+      <pubDate>Sun, 02 Mar 2026 00:00:00 UTC</pubDate>
+      <itunes:duration>240</itunes:duration>
+      <itunes:explicit>false</itunes:explicit>
+      <enclosure url="http://mock-rss/track2.mp3" type="audio/mpeg" length="6000000"/>
+    </item>
+  </channel>
+</rss>

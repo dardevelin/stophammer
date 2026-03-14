@@ -1,0 +1,89 @@
+name: stophammer-e2e-tls
+
+# TLS/ACME end-to-end test environment for stophammer.
+#
+# Uses Pebble (ACME test server) to validate certificate provisioning
+# without hitting real Let's Encrypt rate limits.
+#
+# Stophammer reads TLS_ACME_DIRECTORY_URL to point the ACME client at
+# Pebble instead of Let's Encrypt production/staging.
+#
+# Usage:
+#   docker compose -f docker-compose.e2e-tls.yml up -d --build --wait
+#   # Test Pebble itself is running:
+#   curl -k https://localhost:14000/dir
+#   docker compose -f docker-compose.e2e-tls.yml down -v
+
+services:
+
+  # ── Pebble (ACME test server) ──────────────────────────────────────────────
+
+  pebble:
+    image: ghcr.io/letsencrypt/pebble:latest
+    command:
+      - pebble
+      - -config
+      - /test/config/pebble-config.json
+      - -strict
+    environment:
+      # Accept any domain in HTTP-01 challenges (no real DNS needed).
+      PEBBLE_VA_NOSLEEP:  "1"
+      PEBBLE_VA_ALWAYS_VALID: "1"
+    ports:
+      - "14000:14000"   # ACME directory
+      - "15000:15000"   # Pebble management
+    networks:
+      e2e-tls:
+        aliases:
+          - pebble
+    healthcheck:
+      test: ["CMD", "wget", "--no-check-certificate", "-qO-", "https://127.0.0.1:14000/dir"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+      start_period: 5s
+
+  # ── Primary (TLS mode) ────────────────────────────────────────────────────
+
+  primary-tls:
+    build:
+      context: .
+    environment:
+      NODE_MODE:             primary
+      CRAWL_TOKEN:           test-token
+      ADMIN_TOKEN:           test-admin-token
+      SYNC_TOKEN:            test-sync-token
+      DB_PATH:               /data/stophammer.db
+      KEY_PATH:              /data/signing.key
+      BIND:                  0.0.0.0:8008
+      VERIFIER_CHAIN:        crawl_token,content_hash
+      TZ:                    UTC
+      # TLS configuration for Pebble.
+      TLS_DOMAIN:              test.stophammer.local
+      TLS_ACME_EMAIL:          test@stophammer.local
+      TLS_ACME_DIRECTORY_URL:  https://pebble:14000/dir
+      TLS_CERT_PATH:           /data/tls/cert.pem
+      TLS_KEY_PATH:            /data/tls/key.pem
+      TLS_ACME_ACCOUNT_PATH:   /data/tls/acme-account.json
+    volumes:
+      - primary-tls-data:/data
+    ports:
+      - "8008:8008"
+    networks:
+      - e2e-tls
+    depends_on:
+      pebble:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8008/health"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+
+volumes:
+  primary-tls-data:
+
+networks:
+  e2e-tls:
+    driver: bridge

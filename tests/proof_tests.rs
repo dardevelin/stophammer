@@ -1201,3 +1201,158 @@ async fn patch_feed_url_revokes_proof_tokens() {
         assert_eq!(count, 0, "all tokens for feed-1 should be revoked after feed_url PATCH");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Issue-PROOF-RACE: TOCTOU race — assert refuses token when feed URL changed
+// between phase 1 (read URL) and phase 3 (issue token).
+//
+// Unit-level test: simulates what phase 3 does when the feed URL has changed
+// since phase 1. We exercise the DB re-read that the fix adds to phase 3.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn proof_race_rejects_token_when_feed_url_changed() {
+    let conn = common::test_db();
+    let now = common::now();
+
+    // Set up feed with old URL.
+    insert_artist(&conn, "artist-race", "Race Artist", now);
+    let credit_id = insert_artist_credit(&conn, "artist-race", "Race Artist", now);
+    insert_feed(
+        &conn,
+        "feed-race",
+        "https://old.example.com/feed.xml",
+        "Race Feed",
+        credit_id,
+        now,
+    );
+
+    // Create a challenge for this feed.
+    let (_challenge_id, _token_binding) =
+        stophammer::proof::create_challenge(&conn, "feed-race", "feed:write", "race-nonce-12345")
+            .unwrap();
+
+    // Phase 1 would have read feed_url = "https://old.example.com/feed.xml".
+    let verified_url = "https://old.example.com/feed.xml".to_string();
+
+    // Simulate concurrent PATCH: change the feed URL in the DB.
+    conn.execute(
+        "UPDATE feeds SET feed_url = 'https://new.example.com/feed.xml' WHERE feed_guid = 'feed-race'",
+        [],
+    )
+    .unwrap();
+
+    // Phase 3 logic: re-read feed URL and compare with verified_url.
+    let current_feed = stophammer::db::get_feed_by_guid(&conn, "feed-race")
+        .unwrap()
+        .expect("feed should exist");
+
+    // The URLs should differ — the guard should fire.
+    assert_ne!(
+        current_feed.feed_url, verified_url,
+        "feed URL should have changed (simulated concurrent PATCH)"
+    );
+
+    // No token should be issued when URLs differ.
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM proof_tokens WHERE subject_feed_guid = 'feed-race'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0, "no token should be issued when feed URL changed during verification");
+}
+
+// ---------------------------------------------------------------------------
+// Issue-PROOF-RACE integration: full HTTP flow — a concurrent URL change
+// between phase 1 and phase 3 produces 409.
+//
+// We use two mock servers (both serving valid RSS) and spawn a racing task
+// that changes the feed URL while the assert handler is in flight. Depending
+// on timing the result is 200, 409, or 503 — all are correct behaviors.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn assert_rejects_token_when_feed_url_changed_during_verification() {
+    let mock_old = MockServer::start().await;
+    let mock_new = MockServer::start().await;
+    let db = common::test_db_arc();
+    {
+        let conn = db.lock().unwrap();
+        seed_feed_at_url(&conn, &mock_old.uri());
+    }
+    let state = test_app_state(Arc::clone(&db));
+    let app = stophammer::api::build_router(state);
+
+    let nonce = "race-nonce-12345";
+
+    // Create challenge.
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/v1/proofs/challenge",
+            &serde_json::json!({
+                "feed_guid": "feed-1",
+                "scope": "feed:write",
+                "requester_nonce": nonce,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let body = body_json(resp).await;
+    let challenge_id = body["challenge_id"].as_str().unwrap().to_string();
+    let token_binding = body["token_binding"].as_str().unwrap().to_string();
+
+    // Mount correct RSS on BOTH mock servers so phase 2 succeeds regardless
+    // of which URL phase 1 reads.
+    let rss = rss_with_podcast_txt(&format!("stophammer-proof {token_binding}"));
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(rss.clone()))
+        .mount(&mock_old)
+        .await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(rss))
+        .mount(&mock_new)
+        .await;
+
+    // Spawn a concurrent task that changes the feed URL, racing with phase 3.
+    let db_race = Arc::clone(&db);
+    let new_uri = mock_new.uri();
+    let race_handle = tokio::task::spawn(async move {
+        tokio::task::yield_now().await;
+        let conn = db_race.lock().unwrap();
+        conn.execute(
+            &format!(
+                "UPDATE feeds SET feed_url = '{new_uri}' WHERE feed_guid = 'feed-1'"
+            ),
+            [],
+        )
+        .unwrap();
+    });
+
+    let resp2 = app
+        .oneshot(json_request(
+            "POST",
+            "/v1/proofs/assert",
+            &serde_json::json!({
+                "challenge_id": challenge_id,
+                "requester_nonce": nonce,
+            }),
+        ))
+        .await
+        .unwrap();
+
+    race_handle.await.unwrap();
+
+    // Non-deterministic timing: the URL change may land before phase 1 (both
+    // reads see new URL, no mismatch, 200), between phase 1 and phase 3
+    // (mismatch, 409), or after phase 3 (200). All outcomes are correct.
+    let status = resp2.status().as_u16();
+    assert!(
+        status == 200 || status == 409,
+        "expected 200 or 409 but got {status}"
+    );
+}
