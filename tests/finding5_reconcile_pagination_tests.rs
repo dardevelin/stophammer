@@ -39,6 +39,8 @@ fn json_request(method: &str, uri: &str, body: &serde_json::Value) -> Request<ax
         .method(method)
         .uri(uri)
         .header("Content-Type", "application/json")
+        // Issue-RECONCILE-AUTH — 2026-03-16: reconcile now requires auth.
+        .header("X-Admin-Token", "test-admin-token")
         .body(axum::body::Body::from(serde_json::to_vec(body).expect("serialize")))
         .expect("build request")
 }

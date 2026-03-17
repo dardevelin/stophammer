@@ -14,7 +14,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, LazyLock, RwLock};
 use std::time::Duration;
 
 use axum::{
@@ -642,43 +642,57 @@ async fn handle_ingest_feed(
     let state2 = Arc::clone(&state);
     // Mutex safety compliant — 2026-03-12
     let result = tokio::task::spawn_blocking(move || -> Result<(ingest::IngestResponse, Vec<event::Event>), ApiError> {
+        // Issue-VERIFY-READER — 2026-03-16
+        // Phase 1: verify against a READ-ONLY connection (reader pool).
+        // This avoids holding the writer mutex during verification, so
+        // non-trivial verifiers never block the global write path.
+        let warnings = {
+            let reader = state2.db.reader().map_err(|e| ApiError {
+                status:  StatusCode::INTERNAL_SERVER_ERROR,
+                message: format!("reader pool error: {e}"),
+                www_authenticate: None,
+            })?;
+
+            // 1. Get existing feed (read-only)
+            let existing = db::get_existing_feed(&*reader, &req.canonical_url)?;
+
+            // 2. Build verify context and run chain against reader
+            let ctx = verify::IngestContext {
+                request:  &req,
+                db:       &*reader,  // Issue-VERIFY-READER — ReadConn derefs to Connection
+                existing: existing.as_ref(),
+            };
+
+            match state2.chain.run(&ctx) {
+                Err(ref e) if e.0 == crate::verifiers::content_hash::NO_CHANGE_SENTINEL => {
+                    return Ok((ingest::IngestResponse {
+                        accepted:       true,
+                        no_change:      true,
+                        reason:         None,
+                        events_emitted: vec![],
+                        warnings:       vec![],
+                    }, vec![]));
+                }
+                Err(e) => {
+                    return Ok((ingest::IngestResponse {
+                        accepted:       false,
+                        no_change:      false,
+                        reason:         Some(e.0),
+                        events_emitted: vec![],
+                        warnings:       vec![],
+                    }, vec![]));
+                }
+                Ok(w) => w,
+            }
+        };
+        // reader is dropped here — writer lock is never contested by verification
+
+        // Phase 2: mutate — acquire writer lock only after verification passed.
         let mut conn = state2.db.writer().lock().map_err(|_poison| ApiError {
             status:  StatusCode::INTERNAL_SERVER_ERROR,
             message: "database mutex poisoned".into(),
             www_authenticate: None,
         })?;
-
-        // 1. Get existing feed
-        let existing = db::get_existing_feed(&conn, &req.canonical_url)?;
-
-        // 2. Build verify context and run chain
-        let ctx = verify::IngestContext {
-            request:  &req,
-            db:       &conn,
-            existing: existing.as_ref(),
-        };
-
-        let warnings = match state2.chain.run(&ctx) {
-            Err(ref e) if e.0 == crate::verifiers::content_hash::NO_CHANGE_SENTINEL => {
-                return Ok((ingest::IngestResponse {
-                    accepted:       true,
-                    no_change:      true,
-                    reason:         None,
-                    events_emitted: vec![],
-                    warnings:       vec![],
-                }, vec![]));
-            }
-            Err(e) => {
-                return Ok((ingest::IngestResponse {
-                    accepted:       false,
-                    no_change:      false,
-                    reason:         Some(e.0),
-                    events_emitted: vec![],
-                    warnings:       vec![],
-                }, vec![]));
-            }
-            Ok(w) => w,
-        };
 
         // 3. Unwrap feed_data
         let feed_data = req.feed_data.as_ref().ok_or_else(|| ApiError {
@@ -1006,11 +1020,16 @@ async fn handle_sync_events(
 
 // ── POST /sync/reconcile ──────────────────────────────────────────────────────
 
+// Issue-RECONCILE-AUTH — 2026-03-16
 // Mutex safety compliant — 2026-03-12
 async fn handle_sync_reconcile(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(req): Json<sync::ReconcileRequest>,
 ) -> Result<Json<sync::ReconcileResponse>, ApiError> {
+    // Issue-RECONCILE-AUTH — 2026-03-16: require same auth as /sync/register.
+    check_sync_or_admin_token(&headers, state.sync_token.as_deref(), &state.admin_token)?;
+
     // Availability: cap the size of the `have` set to prevent memory exhaustion.
     if req.have.len() > MAX_RECONCILE_HAVE {
         return Err(ApiError {
@@ -1021,8 +1040,13 @@ async fn handle_sync_reconcile(
     }
 
     // Finding-5 reconcile pagination — 2026-03-13
-    // Issue-WAL-POOL — 2026-03-14: uses writer because upsert_node_sync_state writes
-    let result = spawn_db_write(state.db.clone(), move |conn| {
+    // Issue-RECONCILE-AUTH — 2026-03-16: reconcile is now read-only; the
+    // upsert_node_sync_state write was removed because reconcile's contract is
+    // set-difference comparison, not cursor bookkeeping.  The cursor is already
+    // maintained by apply_event (via SYNC_CURSOR_KEY) and by push-success
+    // recording, so the write here was redundant and created an unnecessary
+    // writer-lock dependency.
+    let result = spawn_db(state.db.clone(), move |conn| {
         let (our_refs, refs_truncated) =
             db::get_event_refs_since(conn, req.since_seq, MAX_RECONCILE_REFS)?;
 
@@ -1047,12 +1071,8 @@ async fn handle_sync_reconcile(
             .filter(|e| missing_ids.contains(&e.event_id))
             .collect();
 
-        let now = db::unix_now();
-
         let has_more = refs_truncated || events_capped;
         let next_seq = our_refs.iter().map(|r| r.seq).max().unwrap_or(req.since_seq);
-
-        db::upsert_node_sync_state(conn, &req.node_pubkey, next_seq, now)?;
 
         Ok(sync::ReconcileResponse {
             send_to_node,
@@ -1098,11 +1118,22 @@ pub async fn fan_out_push_public(
 const PUSH_MAX_ATTEMPTS: u64 = 3;
 
 /// Number of consecutive push failures before a peer is evicted from the
-/// in-memory subscriber cache.
+/// in-memory subscriber cache. Delegates to the shared constant in `db`.
 // SP-04 push retry — 2026-03-13
-const PUSH_EVICTION_THRESHOLD: i64 = 10;
+// Issue-PEER-THRESHOLD — 2026-03-16
+const PUSH_EVICTION_THRESHOLD: i64 = db::MAX_PEER_FAILURES;
+
+/// Issue-PUSH-BOUNDS — 2026-03-16: maximum concurrent push tasks to prevent
+/// unbounded task spawning when there are many peers.
+pub const MAX_CONCURRENT_PUSHES: usize = 16;
+
+/// Issue-PUSH-BOUNDS — 2026-03-16: semaphore enforcing the concurrent push limit.
+static PUSH_SEMAPHORE: LazyLock<tokio::sync::Semaphore> =
+    LazyLock::new(|| tokio::sync::Semaphore::new(MAX_CONCURRENT_PUSHES));
 
 // SP-04 push retry — 2026-03-13
+// Issue-PUSH-BOUNDS — 2026-03-16: Arc-shared batch, semaphore-bounded concurrency,
+// response-body rejection inspection.
 #[expect(clippy::needless_pass_by_value, reason = "values are cloned into spawned tasks; ownership transfer is intentional")]
 fn fan_out_push_inner(
     db:          db_pool::DbPool,
@@ -1118,17 +1149,53 @@ fn fan_out_push_inner(
         guard.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
     };
 
+    // Issue-PUSH-BOUNDS — 2026-03-16: serialize the batch once and share via
+    // Arc<String> to eliminate per-peer cloning of the event vector.
     let body = sync::PushRequest { events };
+    let Ok(serialized_batch) = serde_json::to_string(&body) else {
+        tracing::error!("fanout: failed to serialize push batch; skipping fan-out");
+        return;
+    };
+    let batch = Arc::new(serialized_batch);
 
     for (pubkey, push_url) in peers {
+        // Issue-SYNC-SSRF — 2026-03-16: defense-in-depth re-validation at push time.
+        // Skipped under test-util because wiremock binds to 127.0.0.1.
+        #[cfg(not(feature = "test-util"))]
+        {
+            if let Ok(parsed) = url::Url::parse(&push_url) {
+                if !proof::is_url_ssrf_safe(&parsed) {
+                    tracing::warn!(
+                        peer = %pubkey, url = %push_url,
+                        "fanout: skipping peer with unsafe push URL (SSRF blocked)"
+                    );
+                    continue;
+                }
+            } else {
+                tracing::warn!(
+                    peer = %pubkey, url = %push_url,
+                    "fanout: skipping peer with unparseable push URL"
+                );
+                continue;
+            }
+        }
+
         let client2      = client.clone();
         let db2          = db.clone();
         let subs2        = Arc::clone(&subscribers);
         let pubkey2      = pubkey.clone();
         let push_url2    = push_url.clone();
-        let body2        = sync::PushRequest { events: body.events.clone() };
+        // Issue-PUSH-BOUNDS — 2026-03-16: share serialized batch via Arc
+        // instead of cloning the event vector per peer.
+        let batch2       = Arc::clone(&batch);
 
         tokio::spawn(async move {
+            // Issue-PUSH-BOUNDS — 2026-03-16: acquire semaphore permit to
+            // enforce MAX_CONCURRENT_PUSHES concurrency limit.
+            let _permit = PUSH_SEMAPHORE.acquire().await.expect(
+                "push semaphore closed unexpectedly"
+            );
+
             let mut success = false;
 
             // SP-04 push retry — 2026-03-13
@@ -1138,13 +1205,23 @@ fn fan_out_push_inner(
                 }
                 match client2
                     .post(&push_url2)
-                    .json(&body2)
+                    .header("content-type", "application/json")
+                    .body(batch2.as_ref().clone())
                     .timeout(Duration::from_secs(10))
                     .send()
                     .await
                 {
                     Ok(resp) if resp.status().is_success() => {
-                        success = true;
+                        // Issue-PUSH-BOUNDS — 2026-03-16: inspect response body
+                        // for rejected events to detect silent divergence.
+                        let had_rejections = check_push_response_rejections(
+                            resp, &push_url2, &pubkey2, &db2, &subs2,
+                        ).await;
+                        // Treat a 2xx with rejections as partial failure: do
+                        // not reset consecutive_failures via record_push_success.
+                        if !had_rejections {
+                            success = true;
+                        }
                         break;
                     }
                     Ok(resp) => {
@@ -1180,6 +1257,58 @@ fn fan_out_push_inner(
             }
         });
     }
+}
+
+/// Issue-PUSH-BOUNDS — 2026-03-16: inspect a 2xx push response body for
+/// rejected events. If the peer reports rejected > 0, increment the failure
+/// counter and log a warning so that silent divergence is surfaced.
+///
+/// Returns `true` if the peer reported rejected events (partial failure).
+async fn check_push_response_rejections(
+    resp:        reqwest::Response,
+    push_url:    &str,
+    pubkey:      &str,
+    db:          &db_pool::DbPool,
+    subscribers: &Arc<RwLock<HashMap<String, String>>>,
+) -> bool {
+    let body_text = match resp.text().await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::debug!(
+                url = %push_url, error = %e,
+                "fanout: could not read push response body"
+            );
+            return false;
+        }
+    };
+
+    let push_resp: sync::PushResponse = match serde_json::from_str(&body_text) {
+        Ok(r) => r,
+        Err(_) => {
+            // Peer returned non-JSON 2xx — not necessarily an error, but we
+            // cannot inspect rejection counts.
+            tracing::debug!(
+                url = %push_url,
+                "fanout: push response was not valid PushResponse JSON"
+            );
+            return false;
+        }
+    };
+
+    if push_resp.rejected > 0 {
+        tracing::warn!(
+            peer = %pubkey, url = %push_url,
+            rejected = push_resp.rejected,
+            applied = push_resp.applied,
+            "fanout: peer reported rejected events in 2xx response (possible divergence)"
+        );
+        // Treat non-zero rejections as a partial failure so the eviction
+        // machinery can eventually remove a consistently-rejecting peer.
+        handle_push_failure(db, subscribers, pubkey);
+        return true;
+    }
+
+    false
 }
 
 // SP-04 push retry — 2026-03-13
@@ -1226,6 +1355,7 @@ fn handle_push_failure(
 
 // CS-03 authenticated register — 2026-03-12
 // Finding-3 separate sync token — 2026-03-13
+// Issue-SYNC-SSRF — 2026-03-16
 // Mutex safety compliant — 2026-03-12
 async fn handle_sync_register(
     State(state): State<Arc<AppState>>,
@@ -1233,6 +1363,28 @@ async fn handle_sync_register(
     Json(req): Json<sync::RegisterRequest>,
 ) -> Result<Json<sync::RegisterResponse>, ApiError> {
     check_sync_or_admin_token(&headers, state.sync_token.as_deref(), &state.admin_token)?;
+
+    // Issue-SYNC-SSRF — 2026-03-16: validate node_url against SSRF before storing.
+    #[cfg(feature = "test-util")]
+    let skip_ssrf = state.skip_ssrf_validation;
+    #[cfg(not(feature = "test-util"))]
+    let skip_ssrf = false;
+
+    if !skip_ssrf {
+        let url_for_check = req.node_url.clone();
+        tokio::task::spawn_blocking(move || proof::validate_node_url(&url_for_check))
+            .await
+            .map_err(|e| ApiError {
+                status:  StatusCode::INTERNAL_SERVER_ERROR,
+                message: format!("SSRF validation task failed: {e}"),
+                www_authenticate: None,
+            })?
+            .map_err(|e| ApiError {
+                status:  StatusCode::UNPROCESSABLE_ENTITY,
+                message: e,
+                www_authenticate: None,
+            })?;
+    }
 
     let now = db::unix_now();
 
@@ -1564,13 +1716,14 @@ async fn handle_admin_merge_artists(
     // Finding-2 atomic mutation+event — 2026-03-13
     // Issue-SSE-PUBLISH — 2026-03-14: return (response, sse_frame_info) for SSE publish.
     let result = tokio::task::spawn_blocking(move || -> Result<(MergeArtistsResponse, Option<(String, SseFrame)>), ApiError> {
-        let conn = state2.db.writer().lock().map_err(|_poison| ApiError {
+        let mut conn = state2.db.writer().lock().map_err(|_poison| ApiError {
             status:  StatusCode::INTERNAL_SERVER_ERROR,
             message: "database mutex poisoned".into(),
             www_authenticate: None,
         })?;
 
-        let tx = conn.unchecked_transaction().map_err(|e| ApiError::from(db::DbError::from(e)))?;
+        // Issue-CHECKED-TX — 2026-03-16: conn is freshly acquired from writer lock, no nesting.
+        let tx = conn.transaction().map_err(|e| ApiError::from(db::DbError::from(e)))?;
 
         let transferred = db::merge_artists_sql(&tx, &req.source_artist_id, &req.target_artist_id)
             .map_err(ApiError::from)?;
@@ -2257,7 +2410,9 @@ async fn handle_proofs_assert(
     #[cfg(not(feature = "test-util"))]
     let skip_ssrf = false;
 
-    // Issue-SSRF-REDIRECT — 2026-03-15: capture resolved addresses for DNS pinning
+    // Issue-DNS-REBIND — 2026-03-16: capture resolved addresses for DNS pinning.
+    // validate_feed_url uses std::net::ToSocketAddrs (blocking DNS), so we run
+    // it inside spawn_blocking to avoid stalling the tokio worker thread.
     let resolved_addrs: Vec<std::net::SocketAddr> = if skip_ssrf {
         vec![]
     } else {
@@ -2276,25 +2431,35 @@ async fn handle_proofs_assert(
             })?
     };
 
-    // Issue-SSRF-REDIRECT — 2026-03-15: build a purpose-specific client with
-    // SSRF-safe redirect policy and DNS pinning to prevent rebinding.
-    let proof_client = if skip_ssrf {
-        proof::build_ssrf_safe_client()
+    // Issue-DNS-REBIND — 2026-03-16: use manual redirect following with DNS
+    // pinning at every hop to eliminate TOCTOU rebinding attacks.
+    let rss_verified = if skip_ssrf {
+        let proof_client = proof::build_ssrf_safe_client();
+        proof::verify_podcast_txt(&proof_client, &feed_url, &token_binding)
+            .await
+            .map_err(|e| ApiError {
+                status:  StatusCode::SERVICE_UNAVAILABLE,
+                message: format!("RSS verification failed: {e}"),
+                www_authenticate: None,
+            })?
     } else {
         let hostname = url::Url::parse(&feed_url)
             .ok()
             .and_then(|u| u.host_str().map(String::from))
             .unwrap_or_default();
-        proof::build_ssrf_safe_client_pinned(&hostname, &resolved_addrs)
-    };
-
-    let rss_verified = proof::verify_podcast_txt(&proof_client, &feed_url, &token_binding)
+        proof::verify_podcast_txt_pinned(
+            &feed_url,
+            &token_binding,
+            &hostname,
+            &resolved_addrs,
+        )
         .await
         .map_err(|e| ApiError {
             status:  StatusCode::SERVICE_UNAVAILABLE,
             message: format!("RSS verification failed: {e}"),
             www_authenticate: None,
-        })?;
+        })?
+    };
 
     // ── Phase 3 (blocking): resolve challenge and issue token ─────────────────
     let state3 = Arc::clone(&state);
@@ -2403,7 +2568,7 @@ async fn handle_patch_feed(
     // Mutex safety compliant — 2026-03-12
     // Finding-2 atomic mutation+event — 2026-03-13
     let result = tokio::task::spawn_blocking(move || -> Result<Option<Vec<event::Event>>, ApiError> {
-        let conn = state2.db.writer().lock().map_err(|_poison| ApiError {
+        let mut conn = state2.db.writer().lock().map_err(|_poison| ApiError {
             status:  StatusCode::INTERNAL_SERVER_ERROR,
             message: "database mutex poisoned".into(),
             www_authenticate: None,
@@ -2427,7 +2592,8 @@ async fn handle_patch_feed(
         };
 
         // Wrap mutation + event insert in a single transaction.
-        let tx = conn.unchecked_transaction().map_err(|e| ApiError::from(db::DbError::from(e)))?;
+        // Issue-CHECKED-TX — 2026-03-16: conn is freshly acquired from writer lock, no nesting.
+        let tx = conn.transaction().map_err(|e| ApiError::from(db::DbError::from(e)))?;
 
         tx.execute(
             "UPDATE feeds SET feed_url = ?1 WHERE feed_guid = ?2",
@@ -2568,7 +2734,7 @@ async fn handle_patch_track(
     // Mutex safety compliant — 2026-03-12
     // Finding-2 atomic mutation+event — 2026-03-13
     let result = tokio::task::spawn_blocking(move || -> Result<Option<Vec<event::Event>>, ApiError> {
-        let conn = state2.db.writer().lock().map_err(|_poison| ApiError {
+        let mut conn = state2.db.writer().lock().map_err(|_poison| ApiError {
             status:  StatusCode::INTERNAL_SERVER_ERROR,
             message: "database mutex poisoned".into(),
             www_authenticate: None,
@@ -2595,7 +2761,8 @@ async fn handle_patch_track(
         };
 
         // Wrap mutation + event insert in a single transaction.
-        let tx = conn.unchecked_transaction().map_err(|e| ApiError::from(db::DbError::from(e)))?;
+        // Issue-CHECKED-TX — 2026-03-16: conn is freshly acquired from writer lock, no nesting.
+        let tx = conn.transaction().map_err(|e| ApiError::from(db::DbError::from(e)))?;
 
         tx.execute(
             "UPDATE tracks SET enclosure_url = ?1 WHERE track_guid = ?2",

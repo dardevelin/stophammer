@@ -100,6 +100,17 @@ fn json_request(method: &str, uri: &str, body: &serde_json::Value) -> Request<ax
         .unwrap()
 }
 
+// Issue-RECONCILE-AUTH — 2026-03-16: reconcile now requires sync/admin auth.
+fn json_request_authed(method: &str, uri: &str, body: &serde_json::Value) -> Request<axum::body::Body> {
+    Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("Content-Type", "application/json")
+        .header("X-Admin-Token", "test-admin-token")
+        .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap()
+}
+
 async fn body_json(resp: axum::response::Response) -> serde_json::Value {
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     serde_json::from_slice(&bytes).unwrap()
@@ -295,8 +306,9 @@ async fn reconcile_rejects_oversized_have() {
         })
         .collect();
 
+    // Issue-RECONCILE-AUTH — 2026-03-16: reconcile requires auth.
     let resp = app
-        .oneshot(json_request(
+        .oneshot(json_request_authed(
             "POST",
             "/sync/reconcile",
             &serde_json::json!({
@@ -322,8 +334,9 @@ async fn reconcile_accepts_valid_have() {
     let state = test_app_state(Arc::clone(&db));
     let app = stophammer::api::build_router(state);
 
+    // Issue-RECONCILE-AUTH — 2026-03-16: reconcile requires auth.
     let resp = app
-        .oneshot(json_request(
+        .oneshot(json_request_authed(
             "POST",
             "/sync/reconcile",
             &serde_json::json!({
@@ -414,7 +427,7 @@ fn fts5_truncates_large_field_to_limit() {
 
 #[test]
 fn prune_expired_frees_challenge_slots() {
-    let conn = common::test_db();
+    let mut conn = common::test_db();
     let now = common::now();
     let past = now - 1; // Already expired.
 
@@ -440,7 +453,7 @@ fn prune_expired_frees_challenge_slots() {
     assert_eq!(count, 20);
 
     // Prune should remove all of them.
-    let deleted = stophammer::proof::prune_expired(&conn).unwrap();
+    let deleted = stophammer::proof::prune_expired(&mut conn).unwrap();
     assert!(deleted >= 20, "prune should have deleted at least 20 rows");
 
     // Now the slots are free.

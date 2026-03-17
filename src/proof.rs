@@ -284,9 +284,10 @@ pub fn prune_interval_from_env() -> u64 {
 ///
 /// Returns `DbError` if any SQL operation fails. Both deletes run inside
 /// a single transaction so they are atomic.
-pub fn prune_expired(conn: &Connection) -> Result<usize, DbError> {
+pub fn prune_expired(conn: &mut Connection) -> Result<usize, DbError> {
     let now = now_secs();
-    let tx = conn.unchecked_transaction()?;
+    // Issue-CHECKED-TX — 2026-03-16: conn is freshly acquired from writer lock by caller, no nesting.
+    let tx = conn.transaction()?;
     let challenges_deleted = tx.execute(
         "DELETE FROM proof_challenges WHERE expires_at < ?1",
         params![now],
@@ -407,6 +408,11 @@ pub fn extract_podcast_txt_values(xml: &str) -> Vec<String> {
 // Issue-SSRF-REDIRECT — 2026-03-15
 const MAX_SSRF_REDIRECTS: usize = 3;
 
+// Issue-DNS-REBIND — 2026-03-16
+
+/// Maximum total timeout for the entire redirect chain (seconds).
+const REDIRECT_CHAIN_TIMEOUT_SECS: u64 = 30;
+
 /// Validates that `feed_url` is safe to fetch (no SSRF).
 ///
 /// Rejects:
@@ -464,13 +470,14 @@ pub fn validate_feed_url(feed_url: &str) -> Result<Vec<std::net::SocketAddr>, St
 
 // Issue-SSRF-REDIRECT — 2026-03-15
 
-/// Check whether a URL is safe from an SSRF perspective (synchronous, no DNS).
+/// Check whether a URL is safe from an SSRF perspective (synchronous).
 ///
 /// Used by the custom redirect policy to re-validate each hop in a redirect
-/// chain. Checks scheme and any literal IP in the URL hostname. Does **not**
-/// perform DNS resolution (the redirect target hostname will be resolved by
-/// reqwest, and for literal IPs this catches the attack).
-fn is_url_ssrf_safe(url: &url::Url) -> bool {
+/// chain, and by node-URL registration to reject private/loopback targets.
+/// Checks scheme and any literal IP in the hostname. For hostnames, performs
+/// synchronous DNS resolution and rejects any address in a private range.
+// Issue-SYNC-SSRF — 2026-03-16
+pub fn is_url_ssrf_safe(url: &url::Url) -> bool {
     // Only HTTP(S) schemes are allowed.
     match url.scheme() {
         "http" | "https" => {}
@@ -577,6 +584,223 @@ pub fn build_ssrf_safe_client_pinned(
         .expect("SSRF-safe pinned reqwest client builder uses only safe options")
 }
 
+// Issue-DNS-REBIND — 2026-03-16
+
+/// Resolve a URL's hostname and validate all IPs against SSRF rules.
+///
+/// Returns the hostname and resolved socket addresses. For literal IP hosts,
+/// returns the IP wrapped in a `SocketAddr`. Rejects private/reserved IPs.
+///
+/// # Errors
+///
+/// Returns a human-readable error string if the URL has no host, uses a
+/// disallowed scheme, or resolves to a private/reserved IP.
+pub fn resolve_and_validate_url(url: &url::Url) -> Result<(String, Vec<std::net::SocketAddr>), String> {
+    match url.scheme() {
+        "http" | "https" => {}
+        scheme => return Err(format!("disallowed URL scheme: {scheme}")),
+    }
+
+    let host = url.host_str()
+        .ok_or_else(|| "URL has no host".to_string())?
+        .to_string();
+
+    let port = url.port_or_known_default().unwrap_or(443);
+
+    // Literal IP address: validate directly.
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        if is_private_ip(ip) {
+            return Err(format!("URL targets a private/reserved IP: {ip}"));
+        }
+        return Ok((host, vec![std::net::SocketAddr::new(ip, port)]));
+    }
+
+    // Hostname: resolve and validate all addresses.
+    let socket_addr = format!("{host}:{port}");
+    let addrs: Vec<std::net::SocketAddr> = socket_addr
+        .to_socket_addrs()
+        .map_err(|e| format!("DNS resolution failed for {host}: {e}"))?
+        .collect();
+
+    if addrs.is_empty() {
+        return Err(format!("DNS resolution returned no addresses for {host}"));
+    }
+
+    for addr in &addrs {
+        if is_private_ip(addr.ip()) {
+            return Err(format!("URL hostname resolves to private/reserved IP: {}", addr.ip()));
+        }
+    }
+
+    Ok((host, addrs))
+}
+
+/// Build a `reqwest::Client` with redirects disabled and DNS pinned for a hostname.
+///
+/// Used by `fetch_with_pinned_redirects` to make a single-hop request where
+/// the DNS resolution is locked to the validated addresses.
+fn build_no_redirect_pinned_client(
+    hostname: &str,
+    resolved_addrs: &[std::net::SocketAddr],
+) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(10));
+
+    for addr in resolved_addrs {
+        builder = builder.resolve(hostname, *addr);
+    }
+
+    builder
+        .build()
+        .expect("no-redirect pinned reqwest client builder uses only safe options")
+}
+
+/// Fetches a URL following redirects manually, pinning DNS at each hop.
+///
+/// Eliminates the DNS-rebinding TOCTOU hole: the DNS resolution used for SSRF
+/// validation is the **same** resolution used for the actual TCP connection,
+/// because we pin each hop's addresses via `reqwest::ClientBuilder::resolve`.
+///
+/// The caller provides the pre-validated initial addresses (from `validate_feed_url`
+/// or `resolve_and_validate_url`), so the first hop is already pinned. Each
+/// subsequent redirect target is resolved, validated, and pinned before the
+/// request is sent.
+///
+/// # Errors
+///
+/// Returns a human-readable error string if:
+/// - A redirect target fails SSRF validation
+/// - The redirect chain exceeds `max_redirects`
+/// - Any individual request fails
+/// - The response body exceeds `max_body_bytes`
+pub async fn fetch_with_pinned_redirects(
+    initial_url: &str,
+    initial_hostname: &str,
+    initial_addrs: &[std::net::SocketAddr],
+    max_redirects: usize,
+    max_body_bytes: usize,
+) -> Result<String, String> {
+    use futures_util::StreamExt;
+    use std::time::{Duration, Instant};
+
+    let deadline = Instant::now() + Duration::from_secs(REDIRECT_CHAIN_TIMEOUT_SECS);
+    let mut current_url = initial_url.to_string();
+    let mut current_hostname = initial_hostname.to_string();
+    let mut current_addrs = initial_addrs.to_vec();
+
+    for hop in 0..=max_redirects {
+        let remaining = deadline.checked_duration_since(Instant::now())
+            .unwrap_or(Duration::ZERO);
+        if remaining.is_zero() {
+            return Err("redirect chain timed out".to_string());
+        }
+
+        let client = build_no_redirect_pinned_client(&current_hostname, &current_addrs);
+
+        let resp = client
+            .get(&current_url)
+            .timeout(remaining.min(Duration::from_secs(10)))
+            .send()
+            .await
+            .map_err(|e| format!("RSS fetch failed: {e}"))?;
+
+        let status = resp.status();
+
+        // Not a redirect -- read the body and return.
+        if !status.is_redirection() {
+            if !status.is_success() {
+                return Err(format!("RSS fetch returned HTTP {status}"));
+            }
+
+            // Check Content-Length header before reading.
+            if let Some(cl) = resp.content_length() {
+                if cl > max_body_bytes as u64 {
+                    return Err(format!(
+                        "RSS response too large: {cl} bytes (limit: {max_body_bytes})"
+                    ));
+                }
+            }
+
+            let mut body_bytes = Vec::new();
+            let mut stream = resp.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|e| format!("RSS fetch error: {e}"))?;
+                body_bytes.extend_from_slice(&chunk);
+                if body_bytes.len() > max_body_bytes {
+                    return Err(format!("RSS response exceeds {max_body_bytes} bytes"));
+                }
+            }
+
+            return String::from_utf8(body_bytes)
+                .map_err(|e| format!("RSS response is not valid UTF-8: {e}"));
+        }
+
+        // 3xx redirect: extract Location, resolve, validate, and pin.
+        if hop == max_redirects {
+            return Err(format!("too many redirects (max {max_redirects})"));
+        }
+
+        let location = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .ok_or_else(|| "redirect response missing Location header".to_string())?
+            .to_str()
+            .map_err(|e| format!("invalid Location header: {e}"))?;
+
+        // Resolve relative URLs against the current URL.
+        let base = url::Url::parse(&current_url)
+            .map_err(|e| format!("invalid current URL: {e}"))?;
+        let next_url = base.join(location)
+            .map_err(|e| format!("invalid redirect Location: {e}"))?;
+
+        // Validate and resolve DNS for the redirect target, pinning the result.
+        let (next_hostname, next_addrs) = resolve_and_validate_url(&next_url)
+            .map_err(|e| format!("redirect to {next_url} blocked: {e}"))?;
+
+        current_url = next_url.to_string();
+        current_hostname = next_hostname;
+        current_addrs = next_addrs;
+    }
+
+    Err(format!("too many redirects (max {max_redirects})"))
+}
+
+/// Verify `podcast:txt` with DNS-pinned redirect following.
+///
+/// This is the production entry point for RSS proof verification. Unlike
+/// `verify_podcast_txt` (which takes a pre-built client and relies on reqwest's
+/// built-in redirect handling), this function follows redirects manually with
+/// DNS pinning at every hop, closing the DNS-rebinding TOCTOU hole.
+///
+/// The `initial_hostname` and `initial_addrs` must come from a prior call to
+/// `validate_feed_url` or `resolve_and_validate_url`.
+///
+/// # Errors
+///
+/// Returns `Err(String)` if the RSS feed cannot be fetched, a redirect targets
+/// a private IP, or the response cannot be parsed.
+pub async fn verify_podcast_txt_pinned(
+    feed_url: &str,
+    token_binding: &str,
+    initial_hostname: &str,
+    initial_addrs: &[std::net::SocketAddr],
+) -> Result<bool, String> {
+    let body = fetch_with_pinned_redirects(
+        feed_url,
+        initial_hostname,
+        initial_addrs,
+        MAX_SSRF_REDIRECTS,
+        MAX_RSS_BODY_BYTES,
+    )
+    .await?;
+
+    let expected_text = format!("stophammer-proof {token_binding}");
+    let txt_values = extract_podcast_txt_values(&body);
+
+    Ok(txt_values.iter().any(|v| v == &expected_text))
+}
+
 /// Error type for SSRF redirect policy violations.
 // Issue-SSRF-REDIRECT — 2026-03-15
 #[derive(Debug)]
@@ -601,6 +825,29 @@ impl std::fmt::Display for SsrfRedirectError {
 }
 
 impl std::error::Error for SsrfRedirectError {}
+
+// Issue-SYNC-SSRF — 2026-03-16
+
+/// Validates that `node_url` is safe for peer push registration.
+///
+/// Rejects:
+/// - Non-HTTP(S) schemes (`file://`, `ftp://`, etc.)
+/// - Hostnames that resolve to private/reserved IP ranges
+/// - Literal private/reserved IP addresses in the hostname
+///
+/// # Errors
+///
+/// Returns a human-readable error string if the URL is rejected.
+pub fn validate_node_url(node_url: &str) -> Result<(), String> {
+    let url = url::Url::parse(node_url)
+        .map_err(|e| format!("invalid node URL: {e}"))?;
+
+    if !is_url_ssrf_safe(&url) {
+        return Err(format!("node URL rejected: targets a private/reserved address or uses a disallowed scheme: {node_url}"));
+    }
+
+    Ok(())
+}
 
 /// Returns `true` if the IP address is in a private or reserved range
 /// that should not be reachable via SSRF.

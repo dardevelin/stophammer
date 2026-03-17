@@ -742,7 +742,7 @@ fn recompute_binding_empty_hash_part_returns_none() {
 
 #[test]
 fn prune_expired_deletes_expired_rows() {
-    let conn = common::test_db();
+    let mut conn = common::test_db();
     let now = common::now();
     let past = now - 3600; // 1 hour ago
 
@@ -759,7 +759,7 @@ fn prune_expired_deletes_expired_rows() {
         params![past, past - 3600],
     ).unwrap();
 
-    let deleted = stophammer::proof::prune_expired(&conn).unwrap();
+    let deleted = stophammer::proof::prune_expired(&mut conn).unwrap();
     assert!(deleted >= 2, "should have deleted at least 2 expired rows, got {deleted}");
 
     // Verify the rows are gone.
@@ -782,7 +782,7 @@ fn prune_expired_deletes_expired_rows() {
 
 #[test]
 fn prune_expired_keeps_unexpired_rows() {
-    let conn = common::test_db();
+    let mut conn = common::test_db();
     let now = common::now();
     let future = now + 86400; // 24 hours from now
 
@@ -799,7 +799,7 @@ fn prune_expired_keeps_unexpired_rows() {
         params![future, now],
     ).unwrap();
 
-    let deleted = stophammer::proof::prune_expired(&conn).unwrap();
+    let deleted = stophammer::proof::prune_expired(&mut conn).unwrap();
     assert_eq!(deleted, 0, "no rows should be deleted when all are unexpired");
 
     // Verify the rows still exist.
@@ -822,7 +822,7 @@ fn prune_expired_keeps_unexpired_rows() {
 
 #[test]
 fn prune_expired_returns_correct_count() {
-    let conn = common::test_db();
+    let mut conn = common::test_db();
     let now = common::now();
     let past = now - 3600;
     let future = now + 86400;
@@ -855,7 +855,7 @@ fn prune_expired_returns_correct_count() {
         params![future, now],
     ).unwrap();
 
-    let deleted = stophammer::proof::prune_expired(&conn).unwrap();
+    let deleted = stophammer::proof::prune_expired(&mut conn).unwrap();
     assert_eq!(deleted, 3, "should have deleted 2 challenges + 1 token = 3 total");
 }
 

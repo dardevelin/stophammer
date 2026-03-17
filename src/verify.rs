@@ -9,6 +9,17 @@
 //! [`VerifyResult::Warn`] (accepted, flagged for audit), or
 //! [`VerifyResult::Fail`] (rejected — stops the chain).
 //!
+//! ## Read-only connection contract (Issue-VERIFY-READER)
+//!
+//! Verifiers receive a **read-only** database connection from the reader pool
+//! (`PRAGMA query_only = ON`). The ingest handler runs the full verifier chain
+//! against this reader *before* acquiring the writer lock. This ensures:
+//!
+//! - Verification never blocks the global write path.
+//! - Non-trivial verifiers (external lookups, expensive queries) do not hold
+//!   up other ingest requests waiting for the writer mutex.
+//! - A verification failure avoids acquiring the writer lock entirely.
+//!
 //! # Adding a new verifier (plugin pattern)
 //!
 //! 1. Create `src/verifiers/<name>.rs` implementing the [`Verifier`] trait.
@@ -60,12 +71,20 @@ impl std::error::Error for VerifierError {}
 // ── Context ────────────────────────────────────────────────────────────────
 
 /// Contextual data threaded through the verifier chain for a single ingest request.
+///
+/// The `db` field carries a **read-only** connection (`PRAGMA query_only = ON`).
+/// Verification runs against the reader pool *before* the writer lock is
+/// acquired, so verifiers never block the global write path.
 // CRIT-03 Debug derive — 2026-03-13
+// Issue-VERIFY-READER — 2026-03-16
 #[derive(Debug)]
 pub struct IngestContext<'a> {
     /// The ingest request being validated, including the parsed feed data.
     pub request:  &'a IngestFeedRequest,
-    /// Read-only view of the database, used by verifiers that need prior state.
+    /// **Read-only** database connection (reader pool, `query_only = ON`).
+    ///
+    /// Verifiers may query prior state (e.g. crawl cache) but must NOT attempt
+    /// writes — they will fail at the SQLite level.
     pub db:       &'a Connection,
     /// The feed row already stored for this URL, if one exists.
     ///
@@ -93,6 +112,22 @@ pub enum VerifyResult {
 
 /// A single step in the verifier chain.
 ///
+/// # Connection contract
+///
+/// Verifiers receive a **read-only** database connection through
+/// [`IngestContext::db`]. The connection has `PRAGMA query_only = ON` enforced
+/// at the pool level, so any attempt to execute a write statement will return
+/// a SQLite error. This is intentional:
+///
+/// - Verification is an *inspection* step — it decides whether a mutation is
+///   allowed but must not perform mutations itself.
+/// - Because the connection is read-only, the verifier chain runs **before**
+///   the writer lock is acquired. This means verification never blocks the
+///   global write path and non-trivial verifiers (e.g. external lookups) do
+///   not hold up other ingest requests.
+/// - Verifiers that need external data should cache or pre-fetch it before
+///   the `verify` call rather than reaching out to external services inline.
+///
 /// # Implementing a verifier
 ///
 /// ```rust,ignore
@@ -104,15 +139,19 @@ pub enum VerifyResult {
 ///     fn name(&self) -> &'static str { "my_verifier" }
 ///
 ///     fn verify(&self, ctx: &IngestContext) -> VerifyResult {
-///         // inspect ctx.request or ctx.db, return Pass/Warn/Fail
+///         // inspect ctx.request or ctx.db (read-only), return Pass/Warn/Fail
 ///         VerifyResult::Pass
 ///     }
 /// }
 /// ```
+// Issue-VERIFY-READER — 2026-03-16
 pub trait Verifier: Send + Sync {
     /// Short identifier used in warning and rejection messages, e.g. `"crawl_token"`.
     fn name(&self) -> &'static str;
     /// Run this check against `ctx` and return the outcome.
+    ///
+    /// `ctx.db` is a **read-only** connection (`PRAGMA query_only = ON`).
+    /// Attempting a write will fail at the SQLite level.
     fn verify(&self, ctx: &IngestContext) -> VerifyResult;
 }
 

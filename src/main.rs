@@ -212,11 +212,11 @@ fn spawn_proof_pruner(db: db_pool::DbPool, interval_secs: u64) {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
         loop {
             interval.tick().await;
-            let Ok(conn) = db.writer().lock() else {
+            let Ok(mut conn) = db.writer().lock() else {
                 tracing::error!("proof-pruner: db mutex poisoned, stopping pruner");
                 break;
             };
-            match proof::prune_expired(&conn) {
+            match proof::prune_expired(&mut conn) {
                 Ok(0) => {}
                 Ok(n) => tracing::debug!(pruned = n, "proof-pruner: pruned expired proof rows"),
                 Err(e) => tracing::error!(error = %e, "proof-pruner: prune error"),

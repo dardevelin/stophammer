@@ -151,7 +151,7 @@ const MIGRATIONS: &[&str] = &[
 ///
 /// Returns [`DbError`] if any migration SQL fails or if the bookkeeping
 /// queries fail.
-fn run_migrations(conn: &Connection) -> Result<(), DbError> {
+fn run_migrations(conn: &mut Connection) -> Result<(), DbError> {
     // Ensure the tracker table exists (idempotent).
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -171,7 +171,8 @@ fn run_migrations(conn: &Connection) -> Result<(), DbError> {
         // entries for the index to overflow i64.
         let version = i64::try_from(idx).expect("migration count overflowed i64") + 1;
         if version > current {
-            let tx = conn.unchecked_transaction()?;
+            // Issue-CHECKED-TX — 2026-03-16: conn is freshly opened in open_db, no nesting.
+            let tx = conn.transaction()?;
             tx.execute_batch(sql)?;
             tx.execute(
                 "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
@@ -203,13 +204,13 @@ fn run_migrations(conn: &Connection) -> Result<(), DbError> {
 // dropped and re-populated from the source tables.
 // HIGH-02 impl AsRef<Path> param — 2026-03-13
 pub fn open_db(path: impl AsRef<std::path::Path>) -> Connection {
-    let conn = Connection::open(path.as_ref()).expect("failed to open database");
+    let mut conn = Connection::open(path.as_ref()).expect("failed to open database");
     conn.execute_batch(
         "PRAGMA journal_mode = WAL;\n\
          PRAGMA foreign_keys = ON;\n\
          PRAGMA synchronous = NORMAL;"
     ).expect("failed to set PRAGMAs");
-    run_migrations(&conn).expect("failed to apply migrations");
+    run_migrations(&mut conn).expect("failed to apply migrations");
     conn
 }
 
@@ -2192,6 +2193,11 @@ pub fn upsert_node_sync_state(
 
 // ── peer_nodes ────────────────────────────────────────────────────────────────
 
+/// Maximum consecutive push failures before a peer is considered unhealthy.
+/// Used for both startup reload and runtime eviction.
+// Issue-PEER-THRESHOLD — 2026-03-16
+pub const MAX_PEER_FAILURES: i64 = 10;
+
 /// A peer node registered for push fan-out.
 #[derive(Debug)]
 pub struct PeerNode {
@@ -2202,18 +2208,19 @@ pub struct PeerNode {
     pub consecutive_failures: i64,
 }
 
-/// Returns all peers with `consecutive_failures < 5`.
+/// Returns all peers with `consecutive_failures < MAX_PEER_FAILURES`.
 ///
 /// # Errors
 ///
 /// Returns [`DbError`] if the SQL query fails.
+// Issue-PEER-THRESHOLD — 2026-03-16
 pub fn get_push_peers(conn: &Connection) -> Result<Vec<PeerNode>, DbError> {
     let mut stmt = conn.prepare(
         "SELECT node_pubkey, node_url, discovered_at, last_push_at, consecutive_failures \
-         FROM peer_nodes WHERE consecutive_failures < 5",
+         FROM peer_nodes WHERE consecutive_failures < ?1",
     )?;
 
-    let rows = stmt.query_map([], |row| {
+    let rows = stmt.query_map(rusqlite::params![MAX_PEER_FAILURES], |row| {
         Ok(PeerNode {
             node_pubkey:          row.get(0)?,
             node_url:             row.get(1)?,
